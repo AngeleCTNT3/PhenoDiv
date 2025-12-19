@@ -1,0 +1,1739 @@
+---
+title: "Oxphos Analysis"
+author: "Angèle COUTANT"
+date: "2023-05-03"
+output: html_document
+---
+
+
+                                    ###########################################
+                                    ~     Importation des données scRNAseq    ~
+                                    ###########################################
+
+# Importation des données single-cell
+
+```{r, echo=FALSE, include=FALSE}
+library(Seurat)       # Importation des données/Quantification
+library(scater)       # Control Qualité
+library(sctransform)  # Normalisation par seurat
+library(biomaRt)      # Re Annotation des gènes
+library(AUCell) 
+#library(MAST)         # Analyse différentielle
+library(pROC)
+library(ggplot2)
+library(GSEABase)
+library(cowplot)
+library(RColorBrewer)
+library(data.table)
+#library(harmony)
+# library(devtools)
+# library(SCENT)
+library(DescTools)
+library(plyr)
+
+source('/mnt/Commun/Single_cell/functions.R')
+```
+
+```{r, include = FALSE, message=FALSE}
+all_GO = getGmt('/mnt/Commun/sc_Induction/Donnees/c5.go.bp.v2022.1.Hs.symbols.gmt')
+pid <- 'Glycolyse'
+rainbow_act = c('#339900', '#0066CC', "#E69F00", "#FFCC33", "#990033", "#CC0033")
+
+if (pid == "OxPhos"){
+   color = rainbow_act[3]
+   color2 = rainbow_act[4]
+   activity = "HALLMARK_OXIDATIVE_PHOSPHORYLATION"
+   GO = all_GO[["GOBP_OXIDATIVE_PHOSPHORYLATION"]]@geneIds 
+   gmtFile <- "/mnt/Commun/sc_Induction/Donnees/h.all.v6.2.symbols.gmt"
+   geneSets <- getGmt(gmtFile)
+   HM <- geneSets[[activity]]@geneIds
+   mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+   HM_list <- getBM(attributes=c('external_synonym', 'hgnc_symbol'), filters= "external_synonym" ,values= HM, mart=mart, uniqueRows=T, useCache = FALSE)
+   HM_list2 <- getBM(attributes=c('external_synonym', 'hgnc_symbol'), filters= 'hgnc_symbol' ,values=HM, mart=mart, uniqueRows=T, useCache = FALSE)
+   HM_list <- rbind(HM_list2, HM_list)
+   HM <- unique(c(HM_list$external_synonym, HM_list$hgnc_symbol))
+   # spe_HM = read.csv('/mnt/Commun/sc_Induction/Metabo/OxPhos_pred/HM_specific_OxPhos.csv')
+   # spe_GO = read.csv('/mnt/Commun/sc_Induction/Metabo/OxPhos_pred/GO_specific_OxPhos.csv')
+}
+
+if (pid == 'Glycolyse'){
+   color = rainbow_act[4]
+   color2 = rainbow_act[3]
+   all_GO = getGmt('/mnt/Commun/sc_Induction/Donnees/c5.go.bp.v2022.1.Hs.symbols.gmt')
+   GO = all_GO[["GOBP_POSITIVE_REGULATION_OF_GLUCOSE_METABOLIC_PROCESS"]]@geneIds
+   gmtFile <- "/mnt/Commun/sc_Induction/Donnees/h.all.v6.2.symbols.gmt"
+   geneSets <- getGmt(gmtFile)
+   activity = "HALLMARK_GLYCOLYSIS"
+   HM <- geneSets[[activity]]@geneIds
+   mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+   HM_list <- getBM(attributes=c('external_synonym', 'hgnc_symbol'), filters= "external_synonym" ,values= HM, mart=mart, uniqueRows=T, useCache = FALSE)
+   HM_list2 <- getBM(attributes=c('external_synonym', 'hgnc_symbol'), filters= 'hgnc_symbol' ,values=HM, mart=mart, uniqueRows=T, useCache = FALSE)
+   HM_list <- rbind(HM_list2, HM_list)
+   HM <- unique(c(HM_list$external_synonym, HM_list$hgnc_symbol))
+   # spe_HM = read.csv('/mnt/Commun/sc_Induction/Metabo/Glycolyse_pred/HM_specific_Glyco.csv')
+   spe_GO = read.csv('/mnt/Commun/sc_Induction/Metabo/Glycolyse_pred/GO_specific_Glyco.csv')
+
+}
+
+setwd('/mnt/Commun/sc_Induction/Metabo')
+
+Arnaud = read.csv('/mnt/Commun/sc_Induction/Donnees/union_list_arnaud.csv')
+Arnaud = as.vector(unlist(Arnaud))
+```
+
+
+                                    ###########################################
+                                    ~           QC et normalisation           ~
+                                    ###########################################
+                                    
+
+### QC & Normalisation
+
+```{r, echo=FALSE, include=FALSE}
+# Single Cell experiment
+sce_act <- Read10X(data.dir = sprintf('/mnt/Commun/sc_Induction/Metabo/Donnees/%s_sample_feature_bc_matrix/', pid))
+sce_inact <- Read10X(data.dir = '/mnt/Commun/sc_Induction/Metabo/Donnees/Control_sample_feature_bc_matrix')
+   
+colnames(sce_act[['Gene Expression']]) <- gsub(' ', '', paste(colnames(sce_act[['Gene Expression']]), '_activ'))
+colnames(sce_inact[['Gene Expression']]) <- gsub(' ', '', paste(colnames(sce_inact[['Gene Expression']]), '_inactiv'))
+
+# Convert in Seurat objet
+act_obj <- CreateSeuratObject(sce_act[['Gene Expression']], project = pid)
+inact_obj <- CreateSeuratObject(sce_inact[['Gene Expression']], project = 'Control')
+
+act_obj[["percent.mt"]] <- PercentageFeatureSet(act_obj, pattern = "^MT-")
+inact_obj[["percent.mt"]] <- PercentageFeatureSet(inact_obj, pattern = "^MT-")
+act_obj[["percent.rb"]] <- PercentageFeatureSet(act_obj, pattern = "^RP[SL]")
+inact_obj[["percent.rb"]] <- PercentageFeatureSet(inact_obj, pattern = "^RP[SL]")
+
+pdf(sprintf('Filters_%s.pdf', pid))
+
+VlnPlot(act_obj, features = c("nFeature_RNA","nCount_RNA","percent.mt","percent.rb"), ncol = 4, pt.size = 0.1) & 
+   theme(plot.title = element_text(size=10))
+VlnPlot(inact_obj, features = c("nFeature_RNA","nCount_RNA","percent.mt","percent.rb"),ncol = 4, pt.size = 0.1) & 
+   theme(plot.title = element_text(size=10))
+
+par(mfrow = c(3,1), mar = c(4, 4, 1, 3))
+
+hist(act_obj$nCount_RNA, breaks = 50, xlab = '', main = '', col = color) 
+abline(v=10000, col = 'red', lwd=2)
+abline(v=80000, col='red', lwd=2)
+plot(act_obj$percent.mt ~ act_obj$nCount_RNA, xlab = '', ylab = 'percent.mt', pch =16)
+abline(h=5, col='red', lwd=2)
+plot(act_obj$nFeature_RNA ~ act_obj$nCount_RNA, xlab = sprintf('nCount RNA',pid), ylab = 'n_features', pch =16)
+abline(h=500, col='red', lwd=2)
+
+hist(inact_obj$nCount_RNA, breaks = 50 , xlab = '', main ='', col = 'grey') 
+abline(v=10000, col = 'red', lwd=2)
+abline(v=80000, col='red', lwd=2)
+plot(inact_obj$percent.mt ~ inact_obj$nCount_RNA, xlab = '', ylab = 'percent.mt', pch =16)
+abline(h=5, col='red', lwd=2)
+plot(inact_obj$nFeature_RNA ~ inact_obj$nCount_RNA, xlab = 'nCount RNA (Control)', ylab = 'n_features', pch =16)
+abline(h=500, col='red', lwd=2)
+
+rep(dev.off(), 2)
+
+#Parameters
+
+nfeature = 500
+mt_percent = 5
+max_count = 80000
+min_count = 10000
+
+act_tokeep = which(act_obj$nFeature_RNA > nfeature & act_obj$percent.mt < mt_percent & act_obj$nCount_RNA < max_count & act_obj$nCount_RNA > min_count)
+inact_tokeep = which(inact_obj$nFeature_RNA > nfeature & inact_obj$percent.mt < mt_percent & inact_obj$nCount_RNA < max_count & inact_obj$nCount_RNA > min_count)
+
+Activ <- CreateSeuratObject(counts = sce_act[['Gene Expression']][,act_tokeep], project = pid, min.cells = 3)
+Inactiv <- CreateSeuratObject(counts = sce_inact[['Gene Expression']][,inact_tokeep], project = 'Control', min.cells = 3)
+
+Activ = SCTransform(Activ)
+Inactiv = SCTransform(Inactiv)
+
+##### Normalisation #####
+
+# By cell cycle
+
+# s.genes <- cc.genes$s.genes
+# g2m.genes <- cc.genes$g2m.genes
+#mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+
+
+s.gene = readRDS('/mnt/Commun/sc_Induction/Donnees/s.gene.Rds')
+g2m.gene = readRDS('/mnt/Commun/sc_Induction/Donnees/g2m.gene.Rds')
+
+cols_cycle <- c("S" = "orange", "G2M" = "darkolivegreen2", "G1" = "lightblue")
+
+
+pdf(sprintf('/mnt/Commun/sc_Induction/Metabo/Cell_cycle_norm_%s.pdf', pid))
+CC_act <- CellCycleScoring(object = Activ, s.features = s.gene, g2m.features = g2m.gene, set.ident = TRUE)
+CC_inact <- CellCycleScoring(object = Inactiv, s.features = s.gene, g2m.features = g2m.gene, set.ident = TRUE)
+CC_act.pca <- RunPCA(CC_act, features = c(s.gene, g2m.gene))
+CC_inact.pca <- RunPCA(CC_inact, features = c(s.gene, g2m.gene))
+DimPlot(CC_act.pca, cols = cols_cycle) + ggtitle(sprintf("Before Cell Cycle Norm (%s)", pid))
+DimPlot(CC_inact.pca, cols = cols_cycle) + ggtitle("Before Cell Cycle Norm (Control)")
+
+Activ <- SCTransform(CC_act, vars.to.regress = c("S.Score", "G2M.Score")) 
+Inactiv <- SCTransform(CC_inact, vars.to.regress = c("S.Score", "G2M.Score"))
+pca_act <- RunPCA(Activ, features = c(s.gene, g2m.gene))
+pca_inact <- RunPCA(Inactiv, features = c(s.gene, g2m.gene))
+DimPlot(pca_act, cols = cols_cycle) + ggtitle(sprintf("After Cell Cycle Norm (%s)", pid))
+DimPlot(pca_inact, cols = cols_cycle) + ggtitle("After Cell Cycle Norm (Control)")
+
+dev.off()
+```
+
+```{r}
+# Choix de l'orientation de l'analyse : 
+# - Controle VS Act1
+# - Controle+Act1 VS Act2 (Mixt_Ctrl)
+
+comb = 'Normal' #'Normal' #'Mixt_Ctrl'
+
+if (comb != "Mixt_Ctrl"){
+   setwd('/mnt/Commun/sc_Induction/Metabo/Donnees/')
+   g = intersect(rownames(Activ), rownames(Inactiv))
+   both = cbind(Inactiv@assays[["SCT"]]@counts[g,], Activ@assays[["SCT"]]@counts[g,])
+   
+   #Remove all zero after normalisation
+   both = both[-which(apply(both, 1, sum)==0),]
+   g = rownames(both)
+
+   isActiv <- rep(0:1, c(ncol(Inactiv), ncol(Activ)))
+   activStr <- as.factor(rep(c("inactive","active"), c(ncol(Inactiv), ncol(Activ))))
+   
+   # filtered data for scvelo
+   Inact = as.matrix(Inactiv@assays[["SCT"]]@counts[g,])
+   colnames(Inact) = gsub('_inactiv', '_Control', colnames(Inact))
+   Act = as.matrix(Activ@assays[["SCT"]]@counts[g,])
+   colnames(Act) = gsub('_activ', sprintf('_%s', pid), colnames(Act))
+   # write.csv(Inact, 'Ctrl_filtered.csv')
+   # write.csv(Act, sprintf('%s_filtered.csv',pid))
+}
+
+if (comb == 'Mixt_Ctrl'){
+   if (pid == 'OxPhos'){
+      Ctrl = read.csv('/mnt/Commun/sc_Induction/Metabo/Donnees/Ctrl_filtered.csv')
+      Ctrl2 = read.csv('/mnt/Commun/sc_Induction/Metabo/Donnees/Glycolyse_filtered.csv')
+      rownames(Ctrl) = Ctrl$X
+      rownames(Ctrl2) = Ctrl2$X
+      Ctrl = Ctrl[,-1]
+      Ctrl2 = Ctrl2[,-1]
+      common_genes = intersect(rownames(Ctrl), rownames(Ctrl2))
+      Inactiv = cbind(Ctrl[common_genes,], Ctrl2[common_genes,])
+      colnames(Inactiv) = gsub('.1_Glycolyse','-1_inactiv', colnames(Inactiv))
+      colnames(Inactiv) = gsub('.1_Control','-1_inactiv', colnames(Inactiv))
+
+   }
+   
+   if (pid == 'Glycolyse'){
+      Ctrl = read.csv('/mnt/Commun/sc_Induction/Metabo/Donnees/Ctrl_filtered.csv')
+      Ctrl2 = read.csv('/mnt/Commun/sc_Induction/Metabo/Donnees/OxPhos_filtered.csv')
+      rownames(Ctrl) = Ctrl$X
+      rownames(Ctrl2) = Ctrl2$X
+      Ctrl = Ctrl[,-1]
+      Ctrl2 = Ctrl2[,-1]
+      common_genes = intersect(rownames(Ctrl), rownames(Ctrl2))
+      Inactiv = cbind(Ctrl[common_genes,], Ctrl2[common_genes,])
+      colnames(Inactiv) = gsub('.1_OxPhox','-1_inactiv', colnames(Inactiv))
+      colnames(Inactiv) = gsub('.1_Control','-1_inactiv', colnames(Inactiv))
+   }
+   g = intersect(rownames(Activ), rownames(Inactiv))
+   both = cbind(Inactiv[g,], as.matrix(Activ@assays[["SCT"]]@data)[g,])
+}
+
+
+isActiv <- rep(0:1, c(ncol(Inactiv), ncol(Activ)))
+activStr <- as.factor(rep(c("inactive","active"), c(ncol(Inactiv), ncol(Activ))))
+
+```
+
+
+                        #######################################################
+                        ~              Analysis from bootstraps                ~
+                        #######################################################
+                        
+# Analysis from Bootstraps
+
+### Import bootstraps
+
+Bootstraps were made from JupyterNotebook (Script Python)
+
+```{r}
+Boots = list()
+Boot = paste('boot', seq(1:40), sep='')
+
+for (b in 1:40){
+   Boots[[b]] = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/Bootstraps/boot%i_Glycolyse_OxPhos_Ctrl.csv', b))[,2]
+}
+```
+
+```{r}
+Best_Param = function(g, ntop, shared, id1, id2, col1, col2){
+   All_param = list()
+
+   for( b in 1:length(Boot)){
+      boots = c()
+      parametre = Wstat = pvalue = c()
+      #pdf(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/%s/Distribution_PseudoT.pdf', g, cond))
+
+      for (n in ntop){
+         for (s in shared){
+            print(c(n, s))
+            PseudoT = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/%s/boot%i/Pseudotimes_%s_%s_%i_%i.csv', g, cond ,b, cond, g, n, s ))
+            PseudoT_ctrl = PseudoT[grep(id1, PseudoT$X),]
+            PseudoT_act = PseudoT[grep(id2, PseudoT$X),]
+            par(mfrow = c(2,1))
+            hist(PseudoT_ctrl$velocity_pseudotime, xlim =c(0,1), breaks = 100, col=col1, xlab = '', main= sprintf('Pseudotimes (%s) [%i_%i]', id1, n, s))
+            abline(v=mean(PseudoT_ctrl$velocity_pseudotime), col = 'red',lwd=2)
+            hist(PseudoT_act$velocity_pseudotime, xlim =c(0,1), breaks = 100, col=col2, main=sprintf('Pseudotimes (%s) [%i_%i]', id2, n, s), xlab='')
+            abline(v=mean(PseudoT_act$velocity_pseudotime), col = 'red',lwd=2)
+
+            Wstat = c(Wstat, as.vector(wilcox.test(PseudoT_ctrl$velocity_pseudotime, PseudoT_act$velocity_pseudotime)$statistic))
+            #Wstat = c(Wstat, as.vector(wilcox.test(PseudoT_act$velocity_pseudotime, PseudoT_ctrl$velocity_pseudotime)$statistic))
+
+            pvalue = c(pvalue, as.vector(wilcox.test(PseudoT_ctrl$velocity_pseudotime, PseudoT_act$velocity_pseudotime)$p.value))
+            parametre = c(parametre, paste(n, s, sep='_'))
+            boots = c(boots, Boot[b])
+            # summary_act = summary(PseudoT_act$velocity_pseudotime)
+            # summary_ctrl = summary(PseudoT_ctrl$velocity_pseudotime)
+            # 
+            # Dist = c(Dist, (summary_act[["3rd Qu."]] - summary_ctrl[["1st Qu."]]))
+         }
+      }
+
+      pseudoT_Wilcox = data.frame(Bootstraps = boots, Parametres = parametre, W_stat = Wstat, p_value= pvalue)
+      names(pseudoT_Wilcox)[3:4] =  paste(names(pseudoT_Wilcox)[3:4], sprintf('_%s',cond))
+      All_param[[b]] = pseudoT_Wilcox
+      #dev.off()
+   }
+
+   return(ldply(lapply(All_param, function(w) as.data.frame(w)), rbind))
+   #return(pseudoT_Wilcox)
+}
+```
+
+Here, you have to try all conditions to identifie best parameters from pseudotimes values
+- Pseudotimes from Ctrl to Glyco
+- Pseudotimes from Ctrl to OxPhos
+- Pseudotimes from Oxphos to Glyco
+- Pseudotimes from Glyco to Oxphos
+
+As a reminder, pseudotimes were generated from scvelo + cellrank analysis (Script Python)
+
+```{r, include = FALSE}
+cond = 'OxPhos_Glycolyse'
+id1 = 'OxPhos' #Control, OxPhos, Glycolyse
+id2 = 'Glycolyse'
+ntop = seq(50,300, 50)
+shared = c(25,50,75,100)
+g = 'HM_Glycolyse'
+
+setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/%s', g, cond))
+
+param = Best_Param(g, ntop, shared, id1, id2,color2, color)
+write.csv(param, sprintf('All_param_%s_W2_25oct25.csv', cond))
+#param = param[grep(max(param$Distance), param$Distance),'Parametres']
+#param_O = param
+```
+
+### Select best parameters
+
+```{r}
+Ctrl_glyco_param = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/Ctrl_Glycolyse/All_param_Ctrl_Glycolyse_W_25oct25.csv', g))
+Ctrl_oxphos_param = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/Ctrl_OxPhos/All_param_Ctrl_OxPhos_W_25oct25.csv', g))
+Oxphos_glyco_param1 = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/OxPhos_Glycolyse/All_param_OxPhos_Glycolyse_W_25oct25.csv', g))
+Oxphos_glyco_param2 = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/OxPhos_Glycolyse/All_param_OxPhos_Glycolyse_W2_25oct25.csv', g))
+
+Comb_parameters = unique(Ctrl_glyco_param$Parametres)
+
+W_l = list()
+
+for (b in 1:length(Boot)){
+   W = c()
+   print(sprintf('Bootstrap %s', b))
+   for (i in 1:length(Comb_parameters)){
+      p = Comb_parameters[i]
+      print(p)
+      p1 = Ctrl_glyco_param[which(Ctrl_glyco_param$Parametres == p),][b,'W_stat._Ctrl_Glycolyse']
+      p2 = Ctrl_oxphos_param[which(Ctrl_oxphos_param$Parametres == p),][b,'W_stat._Ctrl_OxPhos']
+      p3.1 = Oxphos_glyco_param1[which(Oxphos_glyco_param1$Parametres == p),][b,'W_stat._OxPhos_Glycolyse']
+      p3.2 = Oxphos_glyco_param2[which(Oxphos_glyco_param2$Parametres == p),][b,'W_stat._OxPhos_Glycolyse']
+      p3 = max(p3.1, p3.2)
+      W_tot = p1+p2+p3
+      W = c(W,W_tot)
+   }
+   W_l[[b]] = W
+}
+names(W_l) = Boot
+#names(Dist_l) = Boot
+
+
+IDx_max_Wtot = lapply(W_l, function(x) which(x == max(x))[1])
+
+#IDx_max_Dist = lapply(Dist_l, function(x) which(x == max(x))[1])
+
+Best_param_per_boot = Comb_parameters[unlist(IDx_max_Wtot)]
+#Best_param_per_boot = Comb_parameters[unlist(IDx_max_Dist)]
+#Best_param = Comb_parameters[which(W == max(W))]
+
+# PseudoT = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/without_boot/Oxphos_Glyco/Pseudotimes_Oxphos_Glyco_Arnaud_%s.csv', Best_param))
+# PseudoT_ctrl = PseudoT[grep("OxPhos", PseudoT$X),]
+# PseudoT_act = PseudoT[grep("Glycolyse", PseudoT$X),]
+# Dist = abs(mean(PseudoT_ctrl$velocity_pseudotime) - mean(PseudoT_act$velocity_pseudotime)) > 0.25
+
+# Dist =c()
+# for (i in 1:length(Best_param_per_boot)){
+#    PseudoT = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/without_boot/Oxphos_Glyco/Pseudotimes_Oxphos_Glyco_Arnaud_%s.csv',g,i,Best_param_per_boot[i]))
+#    PseudoT_ctrl = PseudoT[grep("OxPhos", PseudoT$X),]
+#    PseudoT_act = PseudoT[grep("Glycolyse", PseudoT$X),]
+#    Dist = c(Dist, abs(mean(PseudoT_ctrl$velocity_pseudotime) - mean(PseudoT_act$velocity_pseudotime)) )
+# }
+# DF_best = data.frame(Best_param = Best_param_per_boot, Dist_Oxphos_Glyco = Dist)
+#
+#saveRDS(Best_param, 'Best_param_Glyco_Oxphos.Rds')
+setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/', g))
+write.csv(Best_param_per_boot, 'Best_param_per_boot_24oct25.csv')
+#saveRDS(Best_param, 'Best_param_Glyco_Oxphos.Rds')
+
+```
+
+==> At this step, you can identifie the drivers genes from the best parameters.
+
+### Validation in TCGA
+
+Drivers have to be validated in the TCGA : 
+ - Glycolyse drivers have to be overexpressed in kidney cancer
+ - OxPhos drivers have to be overexpressed in liver cancer
+
+```{r}
+load('/mnt/Commun/sc_Induction/Metabo/Verif_TCGA_drivers/TCGA_data.RData')
+
+Which_cancer = function( Drivers_G, Drivers_O, BC_data, Liver_data, Kidney_data, idb, condition, date){
+   
+   genes_to_remove = names(table(Kidney_data$Hybridization.REF)[which(table(Kidney_data$Hybridization.REF)>1)]) #Les doublons
+   Drivers_G = intersect(Drivers_G, Kidney_data$Hybridization.REF)
+   Drivers_O = intersect(Drivers_O, Kidney_data$Hybridization.REF)
+   
+   BreastCancer = BC_data[-which(BC_data$Hybridization.REF %in% genes_to_remove),]
+   liver = Liver_data[-which(Liver_data$Hybridization.REF %in% genes_to_remove),]
+   kidney = Kidney_data[-which(Kidney_data$Hybridization.REF %in% genes_to_remove),]
+   
+   rownames(BreastCancer) = BreastCancer$Hybridization.REF
+   rownames(liver) = liver$Hybridization.REF
+   rownames(kidney) = kidney$Hybridization.REF
+   
+   BreastCancer = BreastCancer[,-1]
+   liver = liver[,-1]
+   kidney = kidney[,-1]
+   
+   BC_focus = as.matrix(BreastCancer[which(rownames(BreastCancer) %in% c(Drivers_G, Drivers_O)),])
+   Liver_focus = as.matrix(liver[which(rownames(liver) %in% c(Drivers_G, Drivers_O)),])
+   Kidney_focus = as.matrix(kidney[which(rownames(kidney) %in% c(Drivers_G, Drivers_O)),])
+   
+   BC_focus = rbind(BC_focus[which(rownames(BC_focus) %in% Drivers_G),], BC_focus[which(rownames(BC_focus) %in% Drivers_O),])
+   Liver_focus = rbind(Liver_focus[which(rownames(Liver_focus) %in% Drivers_G),], Liver_focus[which(rownames(Liver_focus) %in% Drivers_O),])
+   Kidney_focus = rbind(Kidney_focus[which(rownames(Kidney_focus) %in% Drivers_G),], Kidney_focus[which(rownames(Kidney_focus) %in% Drivers_O),])
+   
+   colnames(BC_focus) = paste('BC_', colnames(BC_focus2), sep='')
+   colnames(Liver_focus) = paste('Liver', colnames(Liver_focus2), sep='')
+   colnames(Kidney_focus) = paste('Kidney', colnames(Kidney_focus2), sep='')
+   rownames(BC_focus) = rownames(BC_focus)
+   rownames(Liver_focus) = rownames(Liver_focus)
+   rownames(Kidney_focus) = rownames(Kidney_focus)
+   
+   interest_mat = cbind(Liver_focus, Kidney_focus2)#, BC_focus))
+   interest_mat_numeric = log2(matrix(as.numeric(interest_mat), ncol = ncol(interest_mat))+1)
+   colnames(interest_mat_numeric) = colnames(interest_mat)
+   rownames(interest_mat_numeric) = rownames(interest_mat)
+   
+   
+   ### Keep significant genes in Kidney Cancer ==> Glycolyse
+   
+   #pdf(sprintf('Glyco_drivers_TCGA_boot_%s_24oct25.pdf', idb))
+   d_glyco_spe = c()
+   
+   for (i in 1:length(Drivers_G)){
+     # t_BC.L = t.test(as.numeric(Liver_focus[Drivers_G[i],]), as.numeric(BC_focus[Drivers_G[i],]))
+      #t_BC.K = t.test(as.numeric(Kidney_focus[Drivers_G[i],]), as.numeric(BC_focus[Drivers_G[i],]))
+      print(i)
+      t_K.L = t.test(as.numeric(Kidney_focus[Drivers_G[i],]), as.numeric(Liver_focus[Drivers_G[i],]))
+      
+      vioplot(log2(as.numeric(Liver_focus[Drivers_G[i],])+1), log2(as.numeric(Kidney_focus[Drivers_G[i],])+1), # log2(as.numeric(BC_focus[Drivers_G[i],])+1),
+              ylab = Drivers_G[i], xaxt='n', col = c('#339900','#FF9933'), main = sprintf("Glyco Drivers (%s)", set),  #,'#FF33CC'
+              xlab = sprintf('t.test Kidney_Liver = %.4f', t_K.L$p.value)) #t.test Liver_BC = %.4f --- t.test Kidney_BC = %.4f --- t_BC.L$p.value, t_BC.K$p.value,
+      axis(1, at=c(1,2), label= c('Liver', 'Kidney'))
+      
+      if (mean(log2(as.numeric(Kidney_focus[Drivers_G[i],])+1)) > mean(log2(as.numeric(Liver_focus[Drivers_G[i],])+1)) 
+          #&& mean(log2(as.numeric(Kidney_focus[Drivers_G[i],])+1)) > mean(log2(as.numeric(BC_focus[Drivers_G[i],])+1))
+          && t_K.L$p.value < 0.05 ){
+          #&& t_BC.K$p.value < 0.05){
+         d_glyco_spe = c(d_glyco_spe, Drivers_G[i] )
+      }
+   }
+   #dev.off()
+   write.csv(d_glyco_spe, sprintf('Drivers_Glycolyse_Specific_Kidney_%s_boot_%s_%s_%s.csv',set, idb, condition, date))
+   
+   ### Keep significant genes in Liver Cancer ==> OxPhos
+   
+   #pdf(sprintf('Oxphos_drivers_TCGA_boot_%s_24oct25.pdf', idb))
+   d_oxphos_spe = c()
+
+   for (i in 1:length(Drivers_O)){
+      # t_BC.L = t.test(as.numeric(Liver_focus[Drivers_O[i],]), as.numeric(BC_focus[Drivers_O[i],]))
+      # t_BC.K = t.test(as.numeric(Kidney_focus[Drivers_O[i],]), as.numeric(BC_focus[Drivers_O[i],]))
+      t_K.L = t.test(as.numeric(Kidney_focus[Drivers_O[i],]), as.numeric(Liver_focus[Drivers_O[i],]))
+      vioplot(log2(as.numeric(Liver_focus[Drivers_O[i],])+1), log2(as.numeric(Kidney_focus[Drivers_O[i],])+1), # log2(as.numeric(BC_focus[Drivers_O[i],])+1),
+              ylab = Drivers_O[i], xaxt='n', col = c('#339900','#FF9933'), main = "Oxphos Drivers",
+              xlab = sprintf('t.test Kidney_Liver = %.4f', t_K.L$p.value))
+      axis(1, at=c(1,2), label= c('Liver', 'Kidney'))
+
+      if (mean(log2(as.numeric(Liver_focus[Drivers_O[i],])+1)) > mean(log2(as.numeric(Kidney_focus[Drivers_O[i],])+1))
+          #&& mean(log2(as.numeric(Liver_focus[Drivers_O[i],])+1)) > mean(log2(as.numeric(BC_focus[Drivers_O[i],])+1))
+          && t_K.L$p.value < 0.05 
+          #&& t_BC.L$p.value < 0.05
+      ){
+         d_oxphos_spe = c(d_oxphos_spe, Drivers_O[i] )
+      }
+   }
+   #dev.off()
+   write.csv(d_oxphos_spe, sprintf('Drivers_OxPhos_Specific_Liver_%s_boot_%s_%s_%s.csv',set, idb, condition, date))
+}
+```
+
+```{r}
+set = "HM_Glycolyse"
+date = '27oct25'
+# Parmis les plus significatifs, selection des 25,50,75... pour affiner la liste !
+condition = 'TOP75' #TOP50' # All #TOP25
+setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/3pop/%s', set, date))
+# Les drivers de sortie, selection des itérations ayant les bons sites initiaux et terminaux pour la recherche de drivers
+FileName = list.files(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/3pop/%s', set, date), pattern = sprintf('Term_OK_%s.csv',date)) 
+
+for (f in 1:length(FileName)){
+   print(f)
+   if (grep("Initial_Glycolyse", FileName[f]) ==1){     # "Initial_OxPhos"
+      if (set == 'GO_bioS_HM' | set == 'GO_Metabo_HM'){
+         idBoot = str_split(FileName[f], '_')[[1]][6]
+         idBoot = str_split(idBoot, 'boot')[[1]][2]
+      }
+      if (set == 'GO_bioS' | set == 'GO_Metabo' | set == 'GO_Glycolyse' | set == 'HM_Glycolyse'){
+         idBoot = str_split(FileName[f], '_')[[1]][5]
+         idBoot = str_split(idBoot, 'boot')[[1]][2]
+      }
+      print(idBoot)
+      
+      setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/3pop/%s', set, date))
+      file = read.csv(FileName[f])
+      
+      drivers_o = file[which(file$OxPhos_corr > 0 & file$OxPhos_qval < 0.001),] # Filtre les drivers les plus significatifs
+      drivers_g = file[which(file$Glycolyse_corr > 0 & file$Glycolyse_qval < 0.001),]
+      
+      if (condition == 'TOP25'){
+         top = 25
+         Best_drivers_OxPhos = drivers_o
+         Oxphos_drivers = Best_drivers_OxPhos[order(Best_drivers_OxPhos$OxPhos_qval, decreasing = F),][1:top,'Gene']
+         
+         Best_drivers_Glyco = drivers_g
+         Glyco_drivers = Best_drivers_Glyco[order(Best_drivers_Glyco$Glycolyse_qval, decreasing = F),][1:top,'Gene']   
+      }
+      if (condition == 'TOP50'){
+         top = 50
+         Best_drivers_OxPhos = drivers_o
+         Oxphos_drivers = Best_drivers_OxPhos[order(Best_drivers_OxPhos$OxPhos_qval, decreasing = F),][1:top,'Gene']
+         
+         Best_drivers_Glyco = drivers_g
+         Glyco_drivers = Best_drivers_Glyco[order(Best_drivers_Glyco$Glycolyse_qval, decreasing = F),][1:top,'Gene']
+      }
+      if (condition == 'TOP75'){
+         top = 75
+         Best_drivers_OxPhos = drivers_o
+         Oxphos_drivers = Best_drivers_OxPhos[order(Best_drivers_OxPhos$OxPhos_qval, decreasing = F),][1:top,'Gene']
+         
+         Best_drivers_Glyco = drivers_g
+         Glyco_drivers = Best_drivers_Glyco[order(Best_drivers_Glyco$Glycolyse_qval, decreasing = F),][1:top,'Gene']
+      }
+      
+      if (condition == 'All'){
+         Oxphos_drivers = drivers_o[which(drivers_o$OxPhos_corr > 0 & drivers_o$OxPhos_qval < 0.001),"Gene"]
+         Glyco_drivers = drivers_g[which(drivers_g$Glycolyse_corr > 0 & drivers_g$Glycolyse_qval < 0.001),'Gene']
+      }
+
+      setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/3pop/%s/Verif_TCGA_Drivers', set, date))
+      
+      Which_cancer(Glyco_drivers, Oxphos_drivers, BC, Liver, Kidney, idBoot, condition, date) # Selection des gènes les plus significatif dans un cancer plutot qu'un autres
+      }
+}
+```
+
+
+                                    ############################################
+                                    ~       AUCell : Enrichment analysis       ~
+                                    ############################################
+
+### AUCell prediction / Model evaluation
+
+```{r}
+npid = 'OxPhos' # L'autre activité
+   
+Boot = paste('Boot', seq(1:40), sep='')
+s_AUCell = c(0.05, 0.1, 0.15, 0.2)
+
+seuil_AUCell = list()
+all_seuil_AUCell = list()
+
+gset_ID_v = c('Drivers_Metabo_Glyco', 'Drivers_Metabo_HM_Glyco_TOP25', 'Drivers_Metabo_HM_Glyco_TOP_50', 'Drivers_Metabo_HM_Glyco_TOP_75')
+
+# gset_ID_v = c('HM', 'GO', 'Drivers_Metabo_OxPhos', "Drivers_Metabo_HM_OxPhos", 'Drivers_Metabo_OxPhos_TOP25', 'Drivers_Metabo_OxPhos_TOP50', 'Drivers_Metabo_OxPhos_TOP75')
+
+for (id in 1:length(gset_ID_v)){
+   gset_ID = gset_ID_v[id]
+   print(gset_ID)
+   
+   for (s in 1:length(s_AUCell)){
+      aucell.v <- c()
+      print(s_AUCell[s])
+      
+      for (b in 1:length(Boot)){
+         print(sprintf("Bootstrap randomisation: n=%d", b))
+
+         
+         if(gset_ID == "HM"){
+            print('HM')
+            gset = HM
+         }
+         
+         if(gset_ID == 'GO'){
+            print('GO')
+            gset = GO
+         }
+         
+         if (gset_ID == 'Drivers_Metabo_OxPhos'){
+            print("Setwd")
+            setwd('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo/3pop/Verif_TCGA_Drivers/Without_boot/')
+            fileName = list.files(pattern = 'Drivers_OxPhos')
+            print(fileName)
+            if (length(grep(sprintf('boot_%i_', b), fileName)) > 0){
+               print('gset')
+               gset = read.csv(fileName[grep(sprintf('boot_%i_', b), fileName)])[,2]
+            }
+            if (length(grep(sprintf('boot_%i_', b), fileName)) == 0){
+               print("next")
+               next
+            }
+         }
+         
+         if (gset_ID == 'Drivers_Metabo_HM_OxPhos'){
+            print("Setwd")
+            setwd('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo_HM/3pop/Verif_TCGA_Drivers/Without_TOP/')
+            fileName = list.files(pattern = 'Drivers_OxPhos')
+            print(fileName)
+            if (length(grep(sprintf('boot_%i_', b), fileName)) > 0){
+               print('gset')
+               gset = read.csv(fileName[grep(sprintf('boot_%i_', b), fileName)])[,2]
+            }
+            if (length(grep(sprintf('boot_%i_', b), fileName)) == 0){
+               print("next")
+               next
+            }
+         }
+         
+         print("TOP25")
+         if (gset_ID == 'Drivers_Metabo_OxPhos_TOP25'){
+            setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo/3pop/Verif_TCGA_Drivers/TOP25/'))
+            fileName = list.files(pattern = 'Drivers_OxPhos')
+            if (length(grep(sprintf('boot_%i_', b), fileName)) > 0){
+               gset = read.csv(fileName[grep(sprintf('boot_%i_', b), fileName)])[,2]
+            }
+            if (length(grep(sprintf('boot_%i_', b), fileName)) == 0){
+               next
+            }
+         }
+         
+         print("TOP50")
+         if (gset_ID == 'Drivers_Metabo_OxPhos_TOP50'){
+            setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo/3pop/Verif_TCGA_Drivers/TOP50/'))
+            fileName = list.files(pattern = 'Drivers_OxPhos')
+            if (length(grep(sprintf('boot_%i_', b), fileName)) > 0){
+               gset = read.csv(fileName[grep(sprintf('boot_%i_', b), fileName)])[,2]
+            }
+            if(length(grep(sprintf('boot_%i_', b), fileName)) == 0){
+               next
+            }
+         }
+         
+         print("TOP75")
+         if (gset_ID == 'Drivers_Metabo_OxPhos_TOP75'){
+            setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo/3pop/Verif_TCGA_Drivers/TOP75/'))
+            fileName = list.files(pattern = 'Drivers_OxPhos')
+            if (length(grep(sprintf('boot_%i.csv', b), fileName)) > 0){
+               gset = read.csv(fileName[grep(sprintf('boot_%i_', b), fileName)])[,2]
+            }
+            if (length(grep(sprintf('boot_%i_', b), fileName)) == 0){
+               next
+            }
+         }
+
+         if (gset_ID == 'Drivers_Metabo_HM_Glyco'){
+            print("Setwd")
+            setwd('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo_HM/3pop/24oct25/Verif_TCGA_Drivers/WhitoutTOP/')
+            fileName = list.files(pattern = 'Drivers_Glycolyse')
+            print(fileName)
+            if (length(grep(sprintf('boot_%i_', b), fileName)) > 0){
+               print('gset')
+               gset = read.csv(fileName[grep(sprintf('boot_%i_', b), fileName)])[,2]
+            }
+            if (length(grep(sprintf('boot_%i_', b), fileName)) == 0){
+               print("next")
+               next
+            }
+         }
+         
+         print("TOP_25")
+         if (gset_ID == 'Drivers_Metabo_HM_Glyco_TOP_25'){
+            setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo_HM/3pop/24oct25/Verif_TCGA_Drivers/TOP25/'))
+            fileName = list.files(pattern = 'Drivers_Glycolyse')
+            if (length(grep(sprintf('boot_%i_', b), fileName)) > 0){
+               gset = read.csv(fileName[grep(sprintf('boot_%i_', b), fileName)])[,2]
+            }
+            if (length(grep(sprintf('boot_%i_', b), fileName)) == 0){
+               next
+            }
+         }
+         
+         print("TOP_50")
+         if (gset_ID == 'Drivers_Metabo_HM_Glyco_TOP_50'){
+            setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo_HM/3pop/24oct25/Verif_TCGA_Drivers/TOP50/'))
+            fileName = list.files(pattern = 'Drivers_Glycolyse')
+            if (length(grep(sprintf('boot_%i_', b), fileName)) > 0){
+               gset = read.csv(fileName[grep(sprintf('boot_%i_', b), fileName)])[,2]
+            }
+            if(length(grep(sprintf('boot_%i_', b), fileName)) == 0){
+               next
+            }
+         }
+         
+         print("TOP_75")
+         if (gset_ID == 'Drivers_Metabo_HM_Glyco_TOP_75'){
+            # setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo_HM/3pop/Verif_TCGA_Drivers/TOP75/'))
+            setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo_HM/3pop/24oct25/Verif_TCGA_Drivers/TOP75'))
+            #fileName = list.files(pattern = 'Drivers_Glycolyse')
+            fileName = list.files(pattern = 'Drivers_Glycolyse')
+            if (length(grep(sprintf('boot_%i.csv', b), fileName)) > 0){
+               gset = read.csv(fileName[grep(sprintf('boot_%i_', b), fileName)])[,2]
+            }
+            if (length(grep(sprintf('boot_%i.', b), fileName)) == 0){
+               next
+            }
+         }
+
+         
+         if (pid == 'Glycolyse'){
+               subcells = Boots[[b]]
+               subcells = gsub('OxPhos', 'Control', subcells)
+            }
+         
+         if (pid == 'OxPhos'){
+               subcells = Boots[[b]]
+               subcells = gsub('Glycolyse', 'Control', subcells)
+            }
+         
+         subcells = gsub('Control', 'inactiv', subcells)
+         subcells = gsub(pid, 'activ', subcells)
+         subcells = gsub(npid, 'inactiv', subcells)
+
+         subcells = which(colnames(both) %in% subcells)
+
+         discov <- both[,subcells]
+         valid <- both[,-subcells]
+         dactiv <- isActiv[subcells]
+         vactiv <- isActiv[-subcells]
+
+         # AUCell GSEA score
+         geneSets[[activity]]@geneIds <- gset
+         gs <- geneSets[[activity]]
+  
+         score = Score_AUCell(as.matrix(valid[,]), gs, s_AUCell[s])
+         names(score) <- colnames(valid)
+         
+         vdat=data.frame(isActiv=vactiv, Score=score)
+         aucell.roc=roc(isActiv ~ Score, data=vdat, levels=c("0", "1"))
+         aucell.v <- c(aucell.v, auc(aucell.roc))
+      }
+      seuil_AUCell[[s]] = aucell.v
+   }
+names(seuil_AUCell) = s_AUCell
+all_seuil_AUCell[[id]] = seuil_AUCell
+}
+names(all_seuil_AUCell) = gset_ID_v
+
+setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/%s_pred/', pid))
+```
+
+```{r}
+boxplot(all_seuil_AUCell$Drivers_Metabo_HM_Glyco_TOP_75, ylim = c(0.5,1), ylab = "Drivers_Metabo_HM_Glyco_TOP_75" , xlab="AUCell threshold")
+medians <- sapply(all_seuil_AUCell$Drivers_Metabo_HM_Glyco_TOP_75, median)
+for (i in 1:length(medians)) {
+    text(x = i, y = medians[i] + 0.025, labels = round(medians[i], 3), cex = 0.8)
+}
+
+boxplot(all_seuil_AUCell$Drivers_Metabo_HM_Glyco_TOP_50, ylim = c(0.5,1), ylab = "Drivers_Metabo_HM_Glyco_TOP_50" , xlab="AUCell threshold")
+medians <- sapply(all_seuil_AUCell$Drivers_Metabo_HM_Glyco_TOP_50, median)
+for (i in 1:length(medians)) {
+    text(x = i, y = medians[i] + 0.025, labels = round(medians[i], 3), cex = 0.8)
+}
+
+boxplot(all_seuil_AUCell$Drivers_Metabo_HM_Glyco_TOP25, ylim = c(0.5,1), ylab = "Drivers_Metabo_HM_Glyco_TOP_25" , xlab="AUCell threshold")
+medians <- sapply(all_seuil_AUCell$Drivers_Metabo_HM_Glyco_TOP25, median)
+for (i in 1:length(medians)) {
+    text(x = i, y = medians[i] + 0.025, labels = round(medians[i], 3), cex = 0.8)
+}
+
+boxplot(all_seuil_AUCell$Drivers_Metabo_Glyco, ylim = c(0.5,1), ylab = "Drivers_Metabo_HM_glyco" , xlab="AUCell threshold")
+medians <- sapply(all_seuil_AUCell$Drivers_Metabo_Glyco, median)
+for (i in 1:length(medians)) {
+    text(x = i, y = medians[i] + 0.025, labels = round(medians[i], 3), cex = 0.8)
+}
+
+
+dev.off()
+
+saveRDS(all_seuil_AUCell, sprintf('all_seuil_AUCell_GO_Metabo_%s_combNorm.Rds', pid))
+
+```
+
+
+
+                                 ###############################################
+                                 #               Without bootstrap             #
+                                 ###############################################
+                                 
+# Analysis from all cells
+
+## Select best parameters
+
+```{r}
+Best_Param = function(g, ntop, shared, id1, id2, col1, col2){
+   All_param = list()
+   parametre = Wstat = pvalue = c()
+   pdf(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/Without_boots/27oct25/%s/Distribution_PseudoT_allCells.pdf', g, cond))
+      
+   for (n in ntop){
+      for (s in shared){
+         print(c(n, s))
+         PseudoT = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/Without_boots/27oct25/%s/Pseudotimes_%s_%s_%s_27oct25.csv', g, cond , g, n, s ))
+         PseudoT_ctrl = PseudoT[grep(id1, PseudoT$X),]
+         PseudoT_act = PseudoT[grep(id2, PseudoT$X),]
+         par(mfrow = c(2,1))
+         hist(PseudoT_ctrl$velocity_pseudotime, xlim =c(0,1), breaks = 100, col=col1, xlab = '', main= sprintf('Pseudotimes (%s) [%s_%s]', id1, n, s))
+         abline(v=mean(PseudoT_ctrl$velocity_pseudotime), col = 'red',lwd=2)
+         hist(PseudoT_act$velocity_pseudotime, xlim =c(0,1), breaks = 100, col=col2, main=sprintf('Pseudotimes (%s) [%s_%s]', id2, n, s), xlab='')
+         abline(v=mean(PseudoT_act$velocity_pseudotime), col = 'red',lwd=2)
+         
+         Wstat = c(Wstat, as.vector(wilcox.test(PseudoT_ctrl$velocity_pseudotime, PseudoT_act$velocity_pseudotime)$statistic))
+         #Wstat = c(Wstat, as.vector(wilcox.test(PseudoT_act$velocity_pseudotime, PseudoT_ctrl$velocity_pseudotime)$statistic))
+         
+         pvalue = c(pvalue, as.vector(wilcox.test(PseudoT_ctrl$velocity_pseudotime, PseudoT_act$velocity_pseudotime)$p.value))
+         parametre = c(parametre, paste(n, s, sep='_'))
+      }
+   }
+   pseudoT_Wilcox = data.frame(Parametres = parametre, W_stat = Wstat, p_value= pvalue)
+   names(pseudoT_Wilcox)[2:3] =  paste(names(pseudoT_Wilcox)[2:3], sprintf('_%s',cond))
+   dev.off()
+   return(pseudoT_Wilcox)
+}
+```
+
+```{r}
+g = 'HM_Glycolyse'
+cond = 'OxPhos_Glyco'
+id1 = "Glyco" #Control #Glyco #OxPhos
+id2 = "OxPhos"
+col1 = color2
+col2 = color
+
+ntop = seq(50, 300, 50)
+shared = seq(25, 100, 25)
+
+setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/Without_boots/27oct25/%s', g, cond))
+
+param = Best_Param(g, ntop, shared, id1, id2, col1, col2)
+write.csv(param, sprintf('All_param_%s_W2_27oct25.csv', cond))
+```
+
+```{r}
+Ctrl_glyco_param = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/Without_boots/27oct25/Ctrl_Glyco/All_param_Ctrl_Glyco_W_27oct25.csv', g))
+Ctrl_oxphos_param = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/Without_boots/27oct25/Ctrl_OxPhos/All_param_Ctrl_OxPhos_W_27oct25.csv', g))
+Oxphos_glyco_param1 = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/Without_boots/27oct25/OxPhos_Glyco/All_param_OxPhos_Glyco_W_27oct25.csv', g))
+Oxphos_glyco_param2 = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/Without_boots/27oct25/OxPhos_Glyco/All_param_OxPhos_Glyco_W2_27oct25.csv', g))
+
+Comb_parameters = unique(Ctrl_glyco_param$Parametres)
+
+
+W = c()
+for (i in 1:length(Comb_parameters)){
+   p = Comb_parameters[i]
+   print(p)
+   p1 = Ctrl_glyco_param[which(Ctrl_glyco_param$Parametres == p),][,'W_stat._Ctrl_Glyco']
+   p2 = Ctrl_oxphos_param[which(Ctrl_oxphos_param$Parametres == p),][,'W_stat._Ctrl_OxPhos']
+   p3.1 = Oxphos_glyco_param1[which(Oxphos_glyco_param1$Parametres == p),][,'W_stat._OxPhos_Glyco']
+   p3.2 = Oxphos_glyco_param2[which(Oxphos_glyco_param2$Parametres == p),][,'W_stat._OxPhos_Glyco']
+   p3 = max(p3.1, p3.2)
+   W_tot = p1+p2+p3
+   W = c(W,W_tot)
+}
+
+IDx_max_Wtot = which(W == max(W))
+
+Best_param_all_cell = Comb_parameters[IDx_max_Wtot]
+
+setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/%s/Without_boots/27oct25', g))
+write.csv(Best_param_all_cell, 'Best_param_all_cells_27oct25.csv')
+
+```
+
+
+
+
+
+
+```{r, echo = FALSE, include = FALSE}
+setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/%s_pred', pid))
+
+FCTHRESHOLD <- log2(1.5)
+seuil_FDR <- 0.05
+
+#s = 0.05  ############## A adapter !!!!! 
+
+mostSigPerClust <- function(clustid, km, allp) {
+   clustidx=which(km$cluster==clustid)
+   return(sort(allp[clustidx])[1])
+}
+
+
+for (s in s_AUCell){
+   print(' ############################################')
+   print(sprintf('           Seuil AUCell = %s                  ', s))
+   print(' ############################################')
+
+   aucell.v <- c()
+   r.aucL =  r.geneL = r.Roc =  list()
+   hm.aucL =  hm.geneL = hm.Roc = list()
+   hmgo.aucL =  hmgo.geneL = hmgo.Roc = list()
+   go.aucL =  go.geneL = go.Roc = list()
+   arnaud.aucL = arnaud.geneL = arnaud.Roc = list()
+   drivers.aucL = drivers.geneL = drivers.Roc = list()
+   speHM.aucL = speHM.geneL = speHM.Roc = list()
+   speGO.aucL = speGO.geneL = speGO.Roc = list()
+   speHMGO.aucL = speHMGO.geneL = speHMGO.Roc = list()
+
+   
+   for (b in 1:length(Boot)){
+      print(sprintf("==========================> Bootstrap randomisation: n=%d <==========================", b))
+      
+      if (comb == 'Mixt_Ctrl'){
+         if (pid == 'OxPhos'){
+            subcells = Boots[[b]]
+            subcells = gsub('Glycolyse', 'inactiv', subcells)
+         }
+         if (pid == 'Glycolyse'){
+            subcells = Boots[[b]]
+            subcells = gsub('OxPhos', 'inactiv', subcells)
+         }
+      }
+         
+      if (comb != 'Mixt_Ctrl'){
+            subcells = Boots[[b]]
+      }
+         
+      subcells = gsub('Control', 'inactiv', subcells)
+      subcells = gsub(pid, 'activ', subcells)
+
+      subcells = which(colnames(both) %in% subcells)
+
+      
+      valid <- both[,-subcells]
+      discov <- both[,subcells]
+      vactiv <- isActiv[-subcells]
+      dactiv <- isActiv[subcells]
+      
+      file = read.csv(sprintf('/mnt/Commun/sc_Induction/Metabo/SCENT/Arnaud/3pop/all_drivers_Arnaud_boot%i.csv', b))
+      subfile = file[c(1,grep(pid, colnames(file)))]
+      drivers = subfile[which(subfile[,2] > 0 & subfile[,4] < 0.05),1]
+      
+      nclust = 6
+      r.genes <- sample(rownames(both), 500)
+      
+      score = Score_AUCell(as.matrix(valid[,]), spe_GO, s)
+      names(score) <- colnames(valid)
+      vdat = data.frame(isActiv=vactiv, Score=score)
+      aucell.roc=roc(isActiv ~ Score, data=vdat, levels=c("0", "1"))
+      aucell.v <- c(aucell.v, auc(aucell.roc))
+      
+      sce <- SingleCellExperiment(colData=list(isActiv=as.factor(activStr[subcells])),
+                                  assays=list(counts=both[,subcells]))
+      
+      filter <- rowSums(assay(sce)>5)>(length(subcells)*.15) ## Only genes with >5 reads in >15% of cells
+      
+      isRand <- rownames(both) %in% r.genes &
+         rowSums(assay(sce)>1)>(length(subcells)*.15) ## Random genes with >1 reads in >1% of cells<
+
+      isDrivers <- rownames(both) %in% drivers
+      
+      isspeHM <- rownames(both) %in% spe_HM[,1] &
+         rowSums(assay(sce)>1)>(length(subcells)*.15)
+      
+      isspeGO<- rownames(both) %in% spe_GO[,1] &
+         rowSums(assay(sce)>1)>(length(subcells)*.15)
+      
+      isspeHMGO <- rownames(both) %in% c(spe_HM[,1], spe_GO[,1]) &
+         rowSums(assay(sce)>1)>(length(subcells)*.15)
+      
+      isHM <- rownames(both) %in% HM &
+         rowSums(assay(sce)>1)>(length(subcells)*.15)
+      
+      isHMGO <- rownames(both) %in% c(HM, GO) &
+         rowSums(assay(sce)>1)>(length(subcells)*.15)
+      
+      isGO <- rownames(both) %in% GO &
+         rowSums(assay(sce)>1)>(length(subcells)*.15)
+      
+       isArnaud <-  rownames(both) %in% Arnaud &
+          rowSums(assay(sce)>1)>(length(subcells)*.15)
+      
+      sce <- sce[filter | isDrivers | isHM | isHMGO | isGO | isArnaud | isRand,]
+      print(table(filter | isDrivers | isHM | isHMGO | isGO | isArnaud | isRand))
+      
+      # sce <- sce[filter | isHM | isHMGO | isGO | isspeHM | isspeGO | isspeHMGO,] 
+      # print(table(filter | isHM | isHMGO | isGO | isspeHM | isspeGO | isspeHMGO ))
+      
+      cdr2 <-colSums(assay(sce)>0)
+      sce@colData$cngeneson = cdr2
+      fdat=data.frame(primerid=rownames(both)[filter | isDrivers | isHM | isHMGO | isGO | isArnaud | isRand]) #
+      #fdat=data.frame(primerid=rownames(both)[filter |  isHM | isHMGO | isGO | isspeHM | isspeGO | isspeHMGO]) #
+
+      sca <- FromMatrix(sce@assays@data, colData(sce), fdat, check_sanity=F)
+      cond <- factor(colData(sca)$isActiv)
+      cond <- relevel(cond,"inactive") 
+      colData(sca)$isActiv <- cond  
+      zlmCond <- zlm(~isActiv + cngeneson, sca)
+      
+      summaryCond <- summary(zlmCond, doLRT='isActivactive')
+      summaryDt <- summaryCond$datatable
+      fcHurdle <- merge(summaryDt[contrast=='isActivactive' & component=='H',.(primerid, `Pr(>Chisq)`)], #hurdle P values
+                        summaryDt[contrast=='isActivactive' & component=='logFC', .(primerid, coef, ci.hi, ci.lo)], by='primerid') #logFC coefficients
+      fcHurdle[,fdr:=p.adjust(`Pr(>Chisq)`, 'fdr')]
+      rownames(fcHurdle) = fcHurdle$primerid
+      #fcHurdleSig <- merge(fcHurdle[fdr<.001 & abs(coef)>FCTHRESHOLD], as.data.table(mcols(sca)), by='primerid')
+      fcHurdleSig <- merge(fcHurdle[fdr<seuil_FDR & abs(coef)>FCTHRESHOLD], as.data.table(mcols(sca)), by='primerid')
+      setorder(fcHurdleSig, fdr)
+      
+      
+      print('>>>>>>>>>>>>>>>> calcul distance')
+      
+      rset <- rownames(discov)[isRand]
+      r.p = unlist(fcHurdle[rset,"fdr"])
+      names(r.p)=rset
+      r.dist = as.dist(1 - cor(t(as.matrix(discov[rset,])), method="spearman")/2)
+
+      dset <- rownames(discov)[isDrivers]
+      drivers.p = unlist(fcHurdle[dset,"fdr"])
+      names(drivers.p)=dset
+      drivers.dist = as.dist(1 - cor(t(as.matrix(discov[dset,])), method="spearman")/2)
+
+      # dsetHM <- rownames(discov)[isspeHM]
+      # spe.pHM = unlist(fcHurdle[dsetHM,"fdr"])
+      # names(spe.pHM)=dsetHM
+      # spe.distHM = as.dist(1 - cor(t(as.matrix(discov[dsetHM,])), method="spearman")/2)
+      # 
+      # dsetGO <- rownames(discov)[isspeGO]
+      # spe.pGO = unlist(fcHurdle[dsetGO,"fdr"])
+      # names(spe.pGO)=dsetGO
+      # spe.distGO = as.dist(1 - cor(t(as.matrix(discov[dsetGO,])), method="spearman")/2)
+      # 
+      # dsetHMGO <- rownames(discov)[isspeHMGO]
+      # spe.pHMGO = unlist(fcHurdle[dsetHMGO,"fdr"])
+      # names(spe.pHMGO)=dsetHMGO
+      # spe.distHMGO = as.dist(1 - cor(t(as.matrix(discov[dsetHMGO,])), method="spearman")/2)
+
+      hmset <- rownames(discov)[isHM]
+      hm.p = unlist(fcHurdle[hmset,"fdr"])
+      names(hm.p)=hmset
+      hm.dist = as.dist(1 - cor(t(as.matrix(discov[hmset,])), method="spearman")/2)
+      
+      hmgoset <- rownames(discov)[isHMGO]
+      hmgo.p = unlist(fcHurdle[hmgoset,"fdr"])
+      names(hmgo.p)=hmgoset
+      hmgo.dist = as.dist(1 - cor(t(as.matrix(discov[hmgoset,])), method="spearman")/2)
+      
+      goset <- rownames(discov)[isGO]
+      go.p = unlist(fcHurdle[goset,"fdr"])
+      names(go.p)=goset
+      go.dist = as.dist(1 - cor(t(as.matrix(discov[goset,])), method="spearman")/2)
+
+      arnaudset <- rownames(discov)[isArnaud]
+      arnaud.p = unlist(fcHurdle[arnaudset,"fdr"])
+      names(arnaud.p)=arnaudset
+      arnaud.dist = as.dist(1 - cor(t(as.matrix(discov[arnaudset,])), method="spearman")/2)
+
+
+      
+      for (n in 1:nclust) {
+         print(sprintf("Fitting %d clusters(s)", n))
+         
+         print('>>>>>>>>>>>>>>>> calcul clusters r')
+         r.clust = kmeans(r.dist, centers = n)
+         r.genes = names(unlist(lapply(1:n, mostSigPerClust, km=r.clust, allp=r.p)))
+
+         print('>>>>>>>>>>>>>>>> calcul clusters drivers')
+         drivers.clust = kmeans(drivers.dist, centers = n)
+         drivers.genes = names(unlist(lapply(1:n, mostSigPerClust, km=drivers.clust, allp=drivers.p)))
+         
+         # spe.clustHM = kmeans(spe.distHM, centers = n)
+         # spe.genesHM = names(unlist(lapply(1:n, mostSigPerClust, km=spe.clustHM, allp=spe.pHM)))
+         # 
+         # spe.clustGO = kmeans(spe.distGO, centers = n)
+         # spe.genesGO = names(unlist(lapply(1:n, mostSigPerClust, km=spe.clustGO, allp=spe.pGO)))
+         # 
+         # spe.clustHMGO = kmeans(spe.distHMGO, centers = n)
+         # spe.genesHMGO = names(unlist(lapply(1:n, mostSigPerClust, km=spe.clustHMGO, allp=spe.pHMGO)))
+         # 
+         
+         print('>>>>>>>>>>>>>>>> calcul clusters hm')
+         hm.clust = kmeans(hm.dist, centers = n)
+         hm.genes = names(unlist(lapply(1:n, mostSigPerClust, km=hm.clust, allp=hm.p)))
+         
+         print('>>>>>>>>>>>>>>>> calcul clusters hmgo')
+         hmgo.clust = kmeans(hmgo.dist, centers = n)
+         hmgo.genes = names(unlist(lapply(1:n, mostSigPerClust, km=hmgo.clust, allp=hmgo.p)))
+         
+         print('>>>>>>>>>>>>>>>> calcul clusters go')
+         go.clust = kmeans(go.dist, centers = n)
+         go.genes = names(unlist(lapply(1:n, mostSigPerClust, km=go.clust, allp=go.p)))
+
+         print('>>>>>>>>>>>>>>>> calcul clusters Arnaud')
+         arnaud.clust = kmeans(arnaud.dist, centers = n)
+         arnaud.genes = names(unlist(lapply(1:n, mostSigPerClust, km=arnaud.clust, allp=arnaud.p)))
+
+         
+         print('AUCell r')
+         if (length(r.genes) > 0){ ## Hack again
+            score_r = Score_AUCell(as.matrix(valid[,]), r.genes, s)
+            names(score_r) <- colnames(valid)
+            vdat=data.frame(isActiv=vactiv, rg=score_r)
+            aucell.roc=roc(isActiv ~ rg, data=vdat, levels=c("0", "1"))
+         }
+         if (length(r.aucL) < n) {
+            r.aucL[[n]] <- c(auc(aucell.roc))
+         } else {
+            r.aucL[[n]] <- c(r.aucL[[n]], auc(aucell.roc))
+         }
+
+         if (length(r.geneL) < n) {
+            r.geneL[[n]] <- c(r.genes)
+         } else {
+            r.geneL[[n]] <- c(r.geneL[[n]], r.genes)
+         }
+         if (length(r.Roc) < n) {
+            r.Roc[[n]] <- c(aucell.roc)
+         } else {
+            r.Roc[[n]] <- c(r.Roc[[n]], aucell.roc)
+         }
+
+         print('AUCell drivers')
+         if (length(drivers.genes) > 0){ ## Hack again
+            score_d = Score_AUCell(as.matrix(valid[,]), drivers.genes, s)
+            names(score_d) <- colnames(valid)
+            vdat=data.frame(isActiv=vactiv, driver=score_d)
+            aucell.roc=roc(isActiv ~ driver, data=vdat, levels=c("0", "1"))
+         }
+         if (length(drivers.aucL) < n) {
+            drivers.aucL[[n]] <-  c(auc(aucell.roc))
+         } else {
+            drivers.aucL[[n]] <- c(drivers.aucL[[n]], auc(aucell.roc))
+         }
+         if (length(drivers.geneL) < n) {
+            drivers.geneL[[n]] <- c(drivers.genes)
+         } else {
+            drivers.geneL[[n]] <- c(drivers.geneL[[n]], drivers.genes)
+         }
+         if (length(drivers.Roc) < n) {
+            drivers.Roc[[n]] <- c(aucell.roc)
+         } else {
+            drivers.Roc[[n]] <- c(drivers.Roc[[n]], aucell.roc)
+         }
+
+         # if (length(spe.genesHM) > 0){ ## Hack again
+         #    score_d = Score_AUCell(as.matrix(valid[,]), spe.genesHM, s)
+         #    names(score_d) <- colnames(valid)
+         #    vdat=data.frame(isActiv=vactiv, driver=score_d)
+         #    aucell.roc=roc(isActiv ~ driver, data=vdat, levels=c("0", "1"))
+         # }
+         # if (length(speHM.aucL) < n) {
+         #    speHM.aucL[[n]] <-  c(auc(aucell.roc))
+         # } else {
+         #    speHM.aucL[[n]] <- c(speHM.aucL[[n]], auc(aucell.roc))
+         # }
+         # if (length(speHM.geneL) < n) {
+         #    speHM.geneL[[n]] <- c(spe.genesHM)
+         # } else {
+         #    speHM.geneL[[n]] <- c(speHM.geneL[[n]], spe.genesHM)
+         # }
+         # if (length(speHM.Roc) < n) {
+         #    speHM.Roc[[n]] <- c(aucell.roc)
+         # } else {
+         #    speHM.Roc[[n]] <- c(speHM.Roc[[n]], aucell.roc)
+         # }
+         # 
+         #       
+         # 
+         # if (length(spe.genesGO) > 0){ ## Hack again
+         #    score_d = Score_AUCell(as.matrix(valid[,]), spe.genesGO, s)
+         #    names(score_d) <- colnames(valid)
+         #    vdat=data.frame(isActiv=vactiv, driver=score_d)
+         #    aucell.roc=roc(isActiv ~ driver, data=vdat, levels=c("0", "1"))
+         # }
+         # if (length(speGO.aucL) < n) {
+         #    speGO.aucL[[n]] <-  c(auc(aucell.roc))
+         # } else {
+         #    speGO.aucL[[n]] <- c(speGO.aucL[[n]], auc(aucell.roc))
+         # }
+         # if (length(speGO.geneL) < n) {
+         #    speGO.geneL[[n]] <- c(spe.genesGO)
+         # } else {
+         #    speGO.geneL[[n]] <- c(speGO.geneL[[n]], spe.genesGO)
+         # }
+         # if (length(speGO.Roc) < n) {
+         #    speGO.Roc[[n]] <- c(aucell.roc)
+         # } else {
+         #    speGO.Roc[[n]] <- c(speGO.Roc[[n]], aucell.roc)
+         # }
+
+         
+         
+         # if (length(spe.genesHMGO) > 0){ ## Hack again
+         #    score_d = Score_AUCell(as.matrix(valid[,]), spe.genesHMGO, s)
+         #    names(score_d) <- colnames(valid)
+         #    vdat=data.frame(isActiv=vactiv, driver=score_d)
+         #    aucell.roc=roc(isActiv ~ driver, data=vdat, levels=c("0", "1"))
+         # }
+         # if (length(speHMGO.aucL) < n) {
+         #    speHMGO.aucL[[n]] <-  c(auc(aucell.roc))
+         # } else {
+         #    speHMGO.aucL[[n]] <- c(speHMGO.aucL[[n]], auc(aucell.roc))
+         # }
+         # if (length(speHMGO.geneL) < n) {
+         #    speHMGO.geneL[[n]] <- c(spe.genesHMGO)
+         # } else {
+         #    speHMGO.geneL[[n]] <- c(speHMGO.geneL[[n]], spe.genesHMGO)
+         # }
+         # if (length(speHMGO.Roc) < n) {
+         #    speHMGO.Roc[[n]] <- c(aucell.roc)
+         # } else {
+         #    speHMGO.Roc[[n]] <- c(speHMGO.Roc[[n]], aucell.roc)
+         # }
+
+         
+         print('AUCell HM')
+         if (length(hm.genes) > 0){ ## Hack again
+            score_hm = Score_AUCell(as.matrix(valid[,]), hm.genes, s)
+            names(score_hm) <- colnames(valid)
+            vdat=data.frame(isActiv=vactiv, hmg=score_hm)
+            aucell.roc=roc(isActiv ~ hmg, data=vdat, levels=c("0", "1"))
+         }
+         if (length(hm.aucL) < n) {
+            hm.aucL[[n]] <- c(auc(aucell.roc))
+         } else {
+            hm.aucL[[n]] <- c(hm.aucL[[n]], auc(aucell.roc))
+         }
+         
+         if (length(hm.geneL) < n) {
+            hm.geneL[[n]] <- c(hm.genes)
+         } else {
+            hm.geneL[[n]] <- c(hm.geneL[[n]], hm.genes)
+         }
+         if (length(hm.Roc) < n) {
+            hm.Roc[[n]] <- c(aucell.roc)
+         } else {
+            hm.Roc[[n]] <- c(hm.Roc[[n]], aucell.roc)
+         }
+         
+         
+         print('AUCell HMGO')
+         if (length(hmgo.genes) > 0){ ## Hack again
+            score_hmgo = Score_AUCell(as.matrix(valid[,]), hmgo.genes, s)
+            names(score_hmgo) <- colnames(valid)
+            vdat=data.frame(isActiv=vactiv, hmgo=score_hmgo)
+            aucell.roc=roc(isActiv ~ hmgo, data=vdat, levels=c("0", "1"))
+         }
+         if (length(hmgo.aucL) < n) {
+            hmgo.aucL[[n]] <- c(auc(aucell.roc))
+         } else {
+            hmgo.aucL[[n]] <- c(hmgo.aucL[[n]], auc(aucell.roc))
+         }
+         
+         if (length(hmgo.geneL) < n) {
+            hmgo.geneL[[n]] <- c(hmgo.genes)
+         } else {
+            hmgo.geneL[[n]] <- c(hmgo.geneL[[n]], hmgo.genes)
+         }
+         if (length(hmgo.Roc) < n) {
+            hmgo.Roc[[n]] <- c(aucell.roc)
+         } else {
+            hmgo.Roc[[n]] <- c(hmgo.Roc[[n]], aucell.roc)
+         }
+         
+         print('AUCell GO')
+         if (length(go.genes) > 0){ ## Hack again
+            score_go = Score_AUCell(as.matrix(valid[,]), go.genes, s)
+            names(score_go) <- colnames(valid)
+            vdat=data.frame(isActiv=vactiv, go=score_go)
+            aucell.roc=roc(isActiv ~ go, data=vdat, levels=c("0", "1"))
+         }
+         if (length(go.aucL) < n) {
+            go.aucL[[n]] <- c(auc(aucell.roc))
+         } else {
+            go.aucL[[n]] <- c(go.aucL[[n]], auc(aucell.roc))
+         }
+
+         if (length(go.geneL) < n) {
+            go.geneL[[n]] <- c(go.genes)
+         } else {
+            go.geneL[[n]] <- c(go.geneL[[n]], go.genes)
+         }
+         if (length(go.Roc) < n) {
+            go.Roc[[n]] <- c(aucell.roc)
+         } else {
+            go.Roc[[n]] <- c(go.Roc[[n]], aucell.roc)
+         }
+         
+         
+         print('AUCell Arnaud')
+         if (length(arnaud.genes) > 0){ ## Hack again
+            score_arnaud = Score_AUCell(as.matrix(valid[,]), arnaud.genes, s)
+            names(score_arnaud) <- colnames(valid)
+            vdat=data.frame(isActiv=vactiv, arnaud=score_arnaud)
+            aucell.roc=roc(isActiv ~ arnaud, data=vdat, levels=c("0", "1"))
+         }
+         if (length(arnaud.aucL) < n) {
+            arnaud.aucL[[n]] <- c(auc(aucell.roc))
+         } else {
+            arnaud.aucL[[n]] <- c(arnaud.aucL[[n]], auc(aucell.roc))
+         }
+
+         if (length(arnaud.geneL) < n) {
+            arnaud.geneL[[n]] <- c(arnaud.genes)
+         } else {
+            arnaud.geneL[[n]] <- c(arnaud.geneL[[n]], arnaud.genes)
+         }
+         if (length(arnaud.Roc) < n) {
+            arnaud.Roc[[n]] <- c(aucell.roc)
+         }
+      }
+   }
+
+
+   # saveRDS(r.aucL, sprintf('r_aucL_%s.RDS',s))
+   # saveRDS(drivers.aucL, sprintf('drivers_aucL_%s.RDS', s))
+   # saveRDS(speHM.aucL, sprintf('hm_aucL_%s_spe.RDS', s))
+   # saveRDS(speGO.aucL, sprintf('go_aucL_%s_spe.RDS', s))
+   # saveRDS(speHMGO.aucL, sprintf('hmgo_aucL_%s_spe.RDS', s))
+   # 
+   # 
+   # saveRDS(arnaud.aucL, sprintf('arnaud_aucL_%s.RDS', s))
+   # 
+   # saveRDS(r.geneL, sprintf('r_geneL_%s.RDS', s))
+   # saveRDS(drivers.geneL, sprintf('drivers_geneL_%s.RDS', s))
+   # saveRDS(speHM.geneL, sprintf('hm_geneL_%s_spe.RDS', s))
+   # saveRDS(speGO.geneL, sprintf('go_geneL_%s_spe.RDS', s))
+   # saveRDS(speHMGO.geneL, sprintf('hmgo_geneL_%s_spe.RDS', s))
+   # saveRDS(arnaud.geneL, sprintf('arnaud_geneL_%s.RDS', s))
+   # 
+   # saveRDS(aucell.v, sprintf('aucell_v_%s.RDS', s))
+   
+   
+   r.m <- unlist(lapply(r.aucL, mean, na.rm=T))
+   r.sd <- unlist(lapply(r.aucL, sd, na.rm=T))
+   drivers.m <- unlist(lapply(drivers.aucL, mean, na.rm=T))
+   drivers.sd <- unlist(lapply(drivers.aucL, sd, na.rm=T))
+   # drivers.mHM <- unlist(lapply(drivers.aucLHM, mean, na.rm=T))
+   # drivers.sdHM <- unlist(lapply(drivers.aucLHM, sd, na.rm=T))
+   # 
+   # drivers.mGO <- unlist(lapply(drivers.aucLGO, mean, na.rm=T))
+   # drivers.sdGO <- unlist(lapply(drivers.aucLGO, sd, na.rm=T))
+   # 
+   # drivers.mHMGO <- unlist(lapply(drivers.aucLHMGO, mean, na.rm=T))
+   # drivers.sdHMGO <- unlist(lapply(drivers.aucLHMGO, sd, na.rm=T))
+
+   hm.m <- unlist(lapply(hm.aucL, mean, na.rm=T))
+   hm.sd <- unlist(lapply(hm.aucL, sd, na.rm=T))
+   hmgo.m <- unlist(lapply(hmgo.aucL, mean, na.rm=T))
+   hmgo.sd <- unlist(lapply(hmgo.aucL, sd, na.rm=T))
+   go.m <- unlist(lapply(go.aucL, mean, na.rm=T))
+   go.sd <- unlist(lapply(go.aucL, sd, na.rm=T))
+   
+   # spehm.m <- unlist(lapply(speHM.aucL, mean, na.rm=T))
+   # spehm.sd <- unlist(lapply(speHM.aucL, sd, na.rm=T))
+   # spehmgo.m <- unlist(lapply(speHMGO.aucL, mean, na.rm=T))
+   # spehmgo.sd <- unlist(lapply(speHMGO.aucL, sd, na.rm=T))
+   # spego.m <- unlist(lapply(speGO.aucL, mean, na.rm=T))
+   # spego.sd <- unlist(lapply(speGO.aucL, sd, na.rm=T))
+   
+   arnaud.m <- unlist(lapply(arnaud.aucL, mean, na.rm=T))
+   arnaud.sd <- unlist(lapply(arnaud.aucL, sd, na.rm=T))
+   
+   pdf(sprintf('Prediction_meth2_%s_seuil_%s.pdf', pid, s))
+   
+   rainbow <- c('#CC0033', '#FF6633', '#FFCC33', '#99CC33', '#009933', '#009999', '#003399', '#330066', '#990066', '#660099', '#3300CC', '#0066CC' )
+   
+   plot(r.m, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[1], ylim=c(0.3,1), lwd=2, main = sprintf('Seuil AUCell = %.2f',s))
+   points(r.m+r.sd, type="l", lty=2, col=rainbow[1], lwd=2)
+   points(r.m-r.sd, type="l", lty=2, col=rainbow[1], lwd=2)
+   
+   points(hm.m, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[2], ylim=c(0.3,1), lwd=2)
+   points(hm.m+hm.sd, type="l", lty=2, col=rainbow[2], lwd=2)
+   points(hm.m-hm.sd, type="l", lty=2, col=rainbow[2], lwd=2)
+   
+   points(go.m, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[3], ylim=c(0.3,1), lwd=2)
+   points(go.m+go.sd, type="l", lty=2, col=rainbow[3], lwd=2)
+   points(go.m-go.sd, type="l", lty=2, col=rainbow[3], lwd=2)
+   
+   points(hmgo.m, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[4], ylim=c(0.3,1), lwd=2)
+   points(hmgo.m+hmgo.sd, type="l", lty=2, col=rainbow[4], lwd=2)
+   points(hmgo.m-hmgo.sd, type="l", lty=2, col=rainbow[4], lwd=2)
+   
+   
+   # points(spehm.m, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[5], ylim=c(0.3,1), lwd=2, main = sprintf('Seuil AUCell = %.2f',s))
+   # points(spehm.m+spehm.sd, type="l", lty=2, col=rainbow[5], lwd=2)
+   # points(spehm.m-spehm.sd, type="l", lty=2, col=rainbow[5], lwd=2)
+   # 
+   # points(spego.m, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[6], ylim=c(0.3,1), lwd=2)
+   # points(spego.m+spego.sd, type="l", lty=2, col=rainbow[6], lwd=2)
+   # points(spego.m-spego.sd, type="l", lty=2, col=rainbow[6], lwd=2)
+   # 
+   # points(spehmgo.m, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[7], ylim=c(0.3,1), lwd=2)
+   # points(spehmgo.m+spehmgo.sd, type="l", lty=2, col=rainbow[7], lwd=2)
+   # points(spehmgo.m-spehmgo.sd, type="l", lty=2, col=rainbow[7], lwd=2)
+   # 
+   
+   points(drivers.m, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[5], ylim=c(0.3,1), lwd=2)
+   points(drivers.m+drivers.sd, type="l", lty=2, col=rainbow[5], lwd=2)
+   points(drivers.m-drivers.sd, type="l", lty=2, col=rainbow[5], lwd=2)
+   
+   # points(drivers.mHM, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[5], ylim=c(0.3,1), lwd=2)
+   # points(drivers.mHM+drivers.sdHM, type="l", lty=2, col=rainbow[5], lwd=2)
+   # points(drivers.mHM-drivers.sdHM, type="l", lty=2, col=rainbow[5], lwd=2)
+   # 
+   # points(drivers.mGO, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[6], ylim=c(0.3,1), lwd=2)
+   # points(drivers.mGO+drivers.sdGO, type="l", lty=2, col=rainbow[6], lwd=2)
+   # points(drivers.mGO-drivers.sdGO, type="l", lty=2, col=rainbow[6], lwd=2)
+   # 
+   # points(drivers.mHMGO, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[7], ylim=c(0.3,1), lwd=2)
+   # points(drivers.mHMGO+drivers.sdHMGO, type="l", lty=2, col=rainbow[7], lwd=2)
+   # points(drivers.mHMGO-drivers.sdHMGO, type="l", lty=2, col=rainbow[7], lwd=2)
+   # 
+   points(arnaud.m, type="l", ylab="AUC score", xlab="Number of genes", col=rainbow[7], ylim=c(0.3,1), lwd=2)
+   points(arnaud.m+arnaud.sd, type="l", lty=2, col=rainbow[7], lwd=2)
+   points(arnaud.m-arnaud.sd, type="l", lty=2, col=rainbow[7], lwd=2)
+   # 
+   abline(h = mean(aucell.v), col="black", lwd=2)
+   abline(h = mean(aucell.v)+sd(aucell.v), col="black", lwd=2, lty = 2)
+   abline(h = mean(aucell.v)-sd(aucell.v), col="black", lwd=2, lty = 2)
+   
+   legend("topright",
+          legend=c('random genes', "HM", "GO","HMGO", "Drivers (from Arnaud genes)", "Arnaud genes", 'spe_GO mean'),
+          col=c(rainbow[1], rainbow[2], rainbow[3], rainbow[4], rainbow[5], rainbow[7], "black"), lty=1, lwd=2, bg="white", cex = 0.8)
+   
+      # legend("topright",
+      #     legend=c("HM", "GO", "HMGO", 'HM spe', 'GO spe', 'HMGO spe', 'mean AUCell'),
+      #     col=c(rainbow[2], rainbow[3], rainbow[4], rainbow[5], rainbow[6], rainbow[7], "black"), lty=1, lwd=2, bg="white", cex = 0.8)
+
+   dev.off()
+   
+} #Fin boucle seuil AUCell
+
+```
+
+#   .
+#   .
+
+
+# Supplement analysis
+
+
+# Evaluation modele avec liste finale 
+
+```{r}
+genes = read.csv('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo/Without_boots/3pop/Verif_drivers_TCGA/final_geneSets_OxPhos_Drivers_GO_Metabo_TOP25.csv')$x
+genes = read.csv('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo_HM/Without_boots/3pop/Verif_drivers_TCGA/final_geneSets_Glyco_Drivers_GO_Metabo.csv')$x
+
+
+geneSets[[activity]]@geneIds <- genes
+gs <- geneSets[[activity]]
+score = Score_AUCell(as.matrix(both), gs, 0.2)
+names(score) <- colnames(both)
+
+summary(score)
+dat=data.frame(isActiv=isActiv, Score=score)
+aucell.roc=roc(isActiv ~ Score, data=dat, levels=c("0", "1"))
+
+seuil = seq(from=as.vector(summary(score))[1],to=as.vector(summary(score))[6],by=0.001)
+Se = Sp = Pr = R = Fmes = c()
+for (s in 1:length(seuil)){
+   VP = ifelse(is.na(as.vector(table(score[grep('_activ',names(score))]>=seuil[s])[2]))==TRUE, 0, as.vector(table(score[grep('_activ',names(score))]>=seuil[s])[2]))
+               
+   FP = ifelse(is.na(as.vector(table(score[grep('_activ',names(score))]>seuil[s])[1]) ) == TRUE, 0, as.vector(table(score[grep('_activ',names(score))]>=seuil[s])[2]))
+   
+   VN = ifelse(is.na(as.vector(table(score[grep('_inactiv',names(score))]<=seuil[s])[2]) ) ==TRUE, 0, as.vector(table(score[grep('_inactiv',names(score))]<=seuil[s])[2]))
+   
+   FN = ifelse(is.na(as.vector(table(score[grep('_inactiv',names(score))]<seuil[s])[1]) ) == TRUE, 0, as.vector(table(score[grep('_inactiv',names(score))]<seuil[s])[1]) )
+   
+   Sensibility = VP/(FN+VP)
+   Se[s] = Sensibility
+   Specificity = VN/(VN+FP)
+   Sp[s] = Specificity
+   Precision = VP/(VP+FP)
+   Pr[s] = Precision
+   Recall = Sensibility
+   R[s] = Recall
+   Fmesure = 2*Precision*Recall / (Precision+Recall)
+   Fmes[s] = Fmesure
+}
+
+#id_seuil=which(abs(Se-Sp) == min(abs(Se-Sp)))
+
+id_seuil=grep(max(Fmes[which(Pr >= 0.5)]), Fmes)
+
+final_seuil = seuil[id_seuil]
+
+setwd(sprintf('/mnt/Commun/sc_Induction/Metabo/%s_pred/',pid))
+saveRDS(final_seuil, sprintf('final_seuil_%s.RDS', pid))
+saveRDS(aucell.roc, sprintf('AUC_score_%s_allCells.RDS', pid))
+
+pdf(sprintf('Evaluation_modele_%s.pdf', pid))
+par(mfrow = c(2,1))
+hist(score[grep('_activ',names(score))], breaks = 50, main = 'AUCell score in Activ cells', xlab = 'AUCell score', xlim = c(as.vector(summary(score)[1]), as.vector(summary(score)[6])), col=color)
+abline(v=final_seuil, col='red')
+hist(score[grep('_inactiv',names(score))], breaks = 50, main = 'AUCell score in Inactiv cells', xlab = 'AUCell score', xlim = c(as.vector(summary(score)[1]), as.vector(summary(score)[6])), col = "grey", )
+abline(v=final_seuil, col='red')
+par(mfrow = c(1,1))
+
+plot(aucell.roc, main = sprintf('AUC score = %.2f \n Sen=%.2f Spe=%.2f Fmes=%.2f',aucell.roc$auc, Se[id_seuil], Sp[id_seuil], Fmes[id_seuil]))
+
+dev.off()
+```
+
+
+# PseudoT VS Entropy
+
+```{r}
+
+pseudotimes = read.csv('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo_HM/Without_boots/Ctrl_Glyco/Pseudotimes_GO_Metabo_HM_1000_50.csv')
+# pseudotimes = read.csv('/mnt/Commun/sc_Induction/Metabo/SCENT/GO_Metabo/Without_boots/Ctrl_OxPhos/Pseudotimes_GO_Metabo_600_25.csv')
+
+
+pseudotimes$X = gsub('_Control', '_inactiv', pseudotimes$X)
+pseudotimes$X = gsub(sprintf('_%s',pid), '_activ', pseudotimes$X)
+
+pseudotime_act = pseudotimes[grep('_activ', pseudotimes$X),]
+pseudotime_inact = pseudotimes[grep('_inactiv', pseudotimes$X),]
+
+pseudotime_act = pseudotime_act[order(pseudotime_act$X, decreasing = F),]
+pseudotime_inact = pseudotime_inact[order(pseudotime_inact$X, decreasing = F),]
+
+Pseudotimes = rbind(pseudotime_act, pseudotime_inact)
+
+
+##### Entropy #####
+#https://rdrr.io/github/aet21/SCENT/f/vignettes/SCENT.Rmd
+data(net13Jun12) # PPI Protein Protein Interaction
+entrezids=rownames(net13Jun12.m)
+mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl",  host = "https://dec2021.archive.ensembl.org")
+#
+q <- getBM(attributes=c('entrezgene_id', 'hgnc_symbol'),
+           filters = 'entrezgene_id',
+           values = entrezids,
+           mart = mart, 
+           useCache = FALSE)
+
+uniqidx <- which(q[,2] %in% unique(q[,2]))
+uniqq <- q[uniqidx,]
+equiv <- uniqq[,2]
+names(equiv) <- uniqq[,1]
+
+tmp <- unlist(lapply(rownames(net13Jun12.m), function(x){ifelse(x %in% names(equiv), equiv[x], x)}))
+symnet <- net13Jun12.m
+rownames(symnet) <- colnames(symnet) <- tmp
+
+logactiv <- log2(Act+1.1)
+loginactiv <- log2(Inact+1.1)
+
+integ.l <- DoIntegPPI(exp.m = logactiv, ppiA.m = symnet)
+integ.l2 <- DoIntegPPI(exp.m = loginactiv, ppiA.m = symnet)
+
+#str(integ.l)
+sr.o <- CompSRana(integ.l, local = FALSE, mc.cores = 3)
+sr.o2 <- CompSRana(integ.l2, local = FALSE, mc.cores = 3)
+
+sr <- sr.o$SR
+sr2 <- sr.o2$SR
+names(sr) <- colnames(logactiv)
+names(sr2) <- colnames(loginactiv)
+# 
+# saveRDS(sr, sprintf("/mnt/Commun/sc_Induction/Metabo/Entropy/%s_sr.Rds",pid))
+# saveRDS(sr2, sprintf("/mnt/Commun/sc_Induction/Metabo/Entropy/%s_sr_control.Rds", pid))
+# #
+sr = readRDS(sprintf('/mnt/Commun/sc_Induction/Metabo/Entropy/%s_sr.Rds', pid))
+sr2 = readRDS(sprintf('/mnt/Commun/sc_Induction/Metabo/Entropy/%s_sr_control.Rds', pid))
+
+
+names(sr) = gsub(pid, 'activ', names(sr))
+names(sr2) = gsub("Control", 'inactiv', names(sr2))
+
+
+pdf(sprintf('SR_entropy_%s.pdf', pid))
+par(mfrow=c(2,1))
+hist(sr, main = sprintf('Differentiation Potency (%s)', pid), xlim = c(summary(c(sr, sr2))[1], summary(c(sr, sr2))[6]), xlab = 'Signaling Entropy Rate (SR)', breaks = 100, col = rainbow_act[4])
+hist(sr2, main = 'Differentiation Potency (Control)', xlim = c(summary(c(sr, sr2))[1], summary(c(sr, sr2))[6]), xlab = 'Signaling Entropy Rate (SR)', breaks = 100, col = 'grey')
+dev.off()
+
+write.table(cbind(names(sr), sr), file=sprintf("/mnt/Commun/sc_Induction/Metabo/Entropy/%s_sr.txt", pid), sep="\t", col.names=F, row.names=F, quote=F)
+write.table(cbind(names(sr2), sr2), file=sprintf("/mnt/Commun/sc_Induction/Metabo/Entropy/%s_sr_control.txt", pid), sep="\t", col.names=F, row.names=F, quote=F)
+
+
+sr = sr[order(names(sr), decreasing = F)]
+sr = sr[which(names(sr) %in% pseudotime_act$X)]
+
+sr2 = sr2[order(names(sr2), decreasing = F)]
+pseudotime_inact$X = gsub('-0', '', pseudotime_inact$X)
+sr2 = sr2[which(names(sr2) %in% pseudotime_inact$X)]
+
+all_sr = c(sr, sr2)
+
+df = data.frame(pseudotime = Pseudotimes$velocity_pseudotime, entropy = all_sr, 
+                col = c(rep(color, nrow(pseudotime_act)), rep('grey', nrow(pseudotime_inact))),
+                type = c(rep('activ', nrow(pseudotime_act)), rep('inactiv', nrow(pseudotime_inact))))
+
+t_entropy = t.test(as.vector(sr), as.vector(sr2))
+
+pdf(sprintf('/mnt/Commun/sc_Induction/Metabo/Entropy/Entropy_ScoreAUCell_%s_Drivers_Glycolyse.pdf', pid))
+ggplot(df, aes(x=type, y=entropy, fill=type)) +  geom_violin() +
+   geom_boxplot(width=0.05, fill="white") + xlab(sprintf('pval = %.3f', t_entropy$p.value)) + theme_classic() + ylab(sprintf('Entropy %s', pid)) +
+   theme(legend.position='none') +
+   theme(plot.title = element_text(size=8)) +
+   scale_fill_manual(values=c(color, "grey"))
+
+
+dev.off()
+
+
+
+
+#####
+
+# ordered_pseudoT = df[order(df$PseudoT, decreasing = F),]
+# pos = seq(1, length(ordered_pseudoT$PseudoT), (length(ordered_pseudoT$PseudoT)*5)/100)
+
+# On active cells
+ordered_pseudoT_act = df[which(df$type == 'activ'),][order(df[which(df$type == 'activ'),]$pseudotime, decreasing = F),]
+pos = seq(1, length(ordered_pseudoT_act$pseudotime), (length(ordered_pseudoT_act$pseudotime)*5)/100)
+
+
+m_entropy = m_pseudoT = c()
+
+for (i in 1:(length(pos)-1)){
+   print(i)
+   m_entropy = c(m_entropy, mean(ordered_pseudoT_act$entropy[pos[i] : pos[i+1]]))
+   m_pseudoT = c(m_pseudoT, mean(as.numeric(ordered_pseudoT_act$PseudoT)[pos[i] : pos[i+1]]))
+}
+
+
+
+
+pdf(sprintf('/mnt/Commun/sc_Induction/Metabo/Entropy_VS_Pseudotime_%s.pdf', pid))
+
+plot(df$entropy~df$pseudotime, col = df$col, pch=c(rep(15, nrow(pseudotime_act)), rep(0, nrow(pseudotime_act))), 
+     xlab = "Pseudotimes", ylab = "Entropy (SR)", ylim = c(0.75, 0.95),
+     main = sprintf('%s \n pearson_cor = %.3f (pval =%s)', pid, cor.test(df$entropy, df$pseudotime)$estimate, cor.test(df$entropy, df$pseudotime)$p.value))
+abline(lm(df$entropy~df$pseudotime))
+lines(m_entropy ~ m_pseudoT, col='black')
+
+# On active cells
+
+#On active cells
+plot(df[which(df$type == 'activ'),]$entropy~df[which(df$type == 'activ'),]$pseudotime, pch = 15, col = df[which(df$type == 'activ'),]$col, 
+     xlab = "Pseudotimes [Induced cells]", ylab = "Entropy (SR) [Induced cells]", ylim = c(0.75, 0.95),
+     main = sprintf('%s \n pearson_cor = %.3f (pval =%s)', pid, cor.test(df[which(df$type == 'activ'),]$entropy, df[which(df$type == 'activ'),]$pseudotime)$estimate, cor.test(df[which(df$type == 'activ'),]$entropy, df[which(df$type == 'activ'),]$pseudotime)$p.value))
+abline(lm(df[which(df$type == 'activ'),]$entropy~df[which(df$type == 'activ'),]$pseudotime))
+#lines(m_entropy_psT ~ m_pseudoT, col='red')
+
+
+dev.off()
+
+
+```
+
+# Gini
+```{r}
+
+setwd('/mnt/Commun/sc_Induction/Metabo/Gini/')
+
+Gini_act = apply(both[,grep('_activ', colnames(both))], 1, function(x){Gini(x)})
+Gini_inact = apply(both[,grep('_inactiv', colnames(both))], 1, function(x){Gini(x)})
+Gini_df = data.frame(Gini_index = c(Gini_act, Gini_inact), pop = c(rep('activ', length(Gini_act)), rep('inact', length(Gini_inact))))
+t_gini = t.test(as.vector(Gini_act), as.vector(Gini_inact))
+
+pdf(sprintf('Gini_%s.pdf', pid))
+ggplot(Gini_df  , aes(x=pop, y=Gini_index, fill=pop)) + geom_violin() +
+   geom_boxplot(width=0.05, fill="white") + xlab(sprintf('pval = %.3f', t_gini$p.value)) + theme_classic() + ylab(sprintf('Gini Index %s', pid)) +
+   theme(legend.position='none') +
+   theme(plot.title = element_text(size=8)) +
+   scale_fill_manual(values=c(color, "grey"))
+par(mfrow = c(2,1))
+hist(Gini_act, col=color, main = 'Induced cells', xlab = "Gini Index", breaks = 50)
+abline(v=0.98, col = 'black', lwd =3)
+hist(Gini_inact, col="grey", main = 'Control cells', xlab = "Gini Index", breaks = 50)
+abline(v=0.98, col = 'black', lwd =3)
+
+dev.off()
+
+ecart_Gini = abs(Gini_act - Gini_inact)
+
+write.csv(Gini_act, sprintf('Gini_act_%s.csv', pid))
+write.csv(Gini_inact, sprintf('Gini_inact_%s.csv', pid))
+
+```
+
+### Gini VS PseutoT
+# Regarder comment évolue Gini en selectionnant uniquement les cellules control +++ et Induite +++ pour mieux voir si y'a un effet de l'induction sur la variabilité transcriptomique.
+Est ce que ca biaise l'analyse ?
+
+```{r}
+hist(pseudotime_act$velocity_pseudotime, breaks = 100, main = 'Pseudotime EMT', col = color, xlab = "Pseudotimes")
+abline(v = 0.6, col='red')
+hist(pseudotime_inact$velocity_pseudotime, breaks = 100, main = 'Pseudotime Control', col = 'grey', xlab = "Pseudotimes")
+abline(v=0.4, col='red')
+PseudoT_act_extrm = pseudotime_act[which(pseudotime_act$velocity_pseudotime > 0.6),]
+PseudoT_inact_extrm = pseudotime_inact[which(pseudotime_inact$velocity_pseudotime < 0.4),]
+PseudoT_inact_extrm$X = gsub('-0', '', PseudoT_inact_extrm$X )
+
+
+Gini_act_extrm = apply(both[,which(colnames(both) %in% PseudoT_act_extrm$X)], 1, function(x){Gini(x)})
+Gini_inact_extrm = apply(both[,which(colnames(both) %in% PseudoT_inact_extrm$X)], 1, function(x){Gini(x)})
+Gini_df = data.frame(Gini_index = c(Gini_act_extrm, Gini_inact_extrm), pop = c(rep('activ', length(Gini_act_extrm)), rep('inact', length(Gini_inact_extrm))))
+
+Gini_act_extrm[which(is.na(Gini_act_extrm))] = 0
+Gini_inact_extrm[which(is.na(Gini_inact_extrm))] = 0
+df_Glyco_extrm = cbind(Gini_act_extrm, Gini_inact_extrm) #na.omit()
+#pval_EMT = t.test(df_EMT$gini_act, df_EMT$gini_inact)$p.value
+pval_Glyco_paired = t.test(as.vector(df_Glyco_extrm[,1]), as.vector(df_Glyco_extrm[,2]), paired = T)$p.value
+Gini_df_Glyco_extrm = data.frame(Gini_index = c(as.vector(df_Glyco_extrm[,1]), as.vector(df_Glyco_extrm[,2])), pop = c(rep('activ',length(Gini_act_extrm)), rep('inact', length(Gini_inact_extrm))))
+
+ggplot(Gini_df_Glyco_extrm  , aes(x=pop, y=Gini_index, fill=pop)) + geom_violin() +
+   geom_boxplot(width=0.05, fill="white") + xlab(sprintf('p.adj (HB) = %.6f', pval_Glyco_paired)) + theme_classic() + ylab('Gini Index Glyco (from Control Cells (PseudoT < 0.4) & Induced cells (PseudoT > 0.6)') +
+   theme(legend.position='none') +
+   theme(plot.title = element_text(size=8)) +
+   scale_fill_manual(values=c(color, "grey"))
+
+```
+
+On voit la meme chose.
