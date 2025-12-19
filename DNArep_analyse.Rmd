@@ -1,0 +1,406 @@
+---
+title: "DNA_rep Analyse"
+author: "Angèle COUTANT"
+date: "2023-03-21"
+output: html_document
+---
+
+```{r, include=FALSE}
+library(Seurat)       # Importation des données/Quantification
+library(scater)       # Control Qualité
+library(sctransform)  # Normalisation par seurat
+library(biomaRt)      # Re Annotation des gènes
+library(AUCell) 
+library(MAST)         # Analyse différentielle
+library(pROC)
+library(ggplot2)
+library(GSEABase)
+library(cowplot)
+library(RColorBrewer)
+library(data.table)
+library(devtools)
+library(SCENT)
+library(DescTools)
+library(plyr)
+
+source('/mnt/Commun/Single_cell/functions.R')
+load("/mnt/Commun/Donnees/GOgenes_HGNC_ExtSymb.RData")
+```
+
+### Preprocessing : QC & Normalisation
+
+```{r}
+rainbow_act = c('#339900', '#0066CC', "#E69F00", "#FFCC33", "#990033", "#CC0033")
+
+pid <- 'DNArep'
+setwd(sprintf('/mnt/Commun/sc_Induction/%s/', pid))
+
+color = rainbow_act[2]
+activity = "HALLMARK_DNA_REPAIR"
+GO = genesGO["GO_DNA_REPAIR"][["GO_DNA_REPAIR"]]@geneIds
+GO_damage = genesGO["GO_DNA_DAMAGE_RESPONSE_DETECTION_OF_DNA_DAMAGE"][["GO_DNA_DAMAGE_RESPONSE_DETECTION_OF_DNA_DAMAGE"]]@geneIds
+
+gmtFile <- "/mnt/Commun/sc_Induction/Donnees/h.all.v6.2.symbols.gmt"
+geneSets <- getGmt(gmtFile)
+HM <- geneSets[[activity]]@geneIds
+mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+HM_list <- getBM(attributes=c('external_synonym', 'hgnc_symbol'), filters= "external_synonym" ,values= HM, mart=mart, uniqueRows=T, useCache = FALSE)
+HM_list2 <- getBM(attributes=c('external_synonym', 'hgnc_symbol'), filters= 'hgnc_symbol' ,values=HM, mart=mart, uniqueRows=T, useCache = FALSE)
+HM_list <- rbind(HM_list2, HM_list)
+HM <- unique(c(HM_list$external_synonym, HM_list$hgnc_symbol))
+
+```
+
+```{r, echo=FALSE, include=FALSE}
+sce_act <- Read10X(data.dir = sprintf('/mnt/Commun/sc_Induction/%s/Donnees/%s_filtered_feature_bc_matrix', pid, pid))
+sce_inact <- Read10X(data.dir = sprintf('/mnt/Commun/sc_Induction/%s/Donnees/Control_filtered_feature_bc_matrix/',pid))
+colnames(sce_act) = paste(colnames(sce_act), '_activ', sep = '')
+colnames(sce_inact) = paste(colnames(sce_inact), '_inactiv', sep = '')
+
+act_obj = CreateSeuratObject(sce_act, project = pid)
+inact_obj = CreateSeuratObject(sce_inact, project = 'Control')
+
+act_obj[["percent.mt"]] <- PercentageFeatureSet(act_obj, pattern = "^MT-")
+inact_obj[["percent.mt"]] <- PercentageFeatureSet(inact_obj, pattern = "^MT-")
+act_obj[["percent.rb"]] <- PercentageFeatureSet(act_obj, pattern = "^RP[SL]")
+inact_obj[["percent.rb"]] <- PercentageFeatureSet(inact_obj, pattern = "^RP[SL]")
+
+pdf('Filters.pdf')
+
+VlnPlot(act_obj, features = c("nFeature_RNA","nCount_RNA","percent.mt","percent.rb"),ncol = 4, pt.size = 0.1) & 
+   theme(plot.title = element_text(size=10))
+VlnPlot(inact_obj, features = c("nFeature_RNA","nCount_RNA","percent.mt","percent.rb"),ncol = 4, pt.size = 0.1) & 
+   theme(plot.title = element_text(size=10))
+
+par(mfrow = c(3,1), mar = c(4, 4, 1, 3))
+
+hist(act_obj$nCount_RNA, breaks = 50, xlab = '', main = '', col=color) 
+abline(v=10000, col = 'red', lwd=2)
+abline(v=80000, col='red', lwd=2)
+plot(act_obj$percent.mt ~ act_obj$nCount_RNA, xlab = '', ylab = 'percent.mt', pch =16)
+abline(h=20, col='red', lwd=2)
+plot(act_obj$nFeature_RNA ~ act_obj$nCount_RNA, xlab = sprintf('nCount RNA',pid), ylab = 'n_features', pch =16)
+abline(h=200, col='red', lwd=2)
+
+hist(inact_obj$nCount_RNA, breaks = 50 , xlab = '', main ='', col='grey') 
+abline(v=10000, col = 'red', lwd=2)
+abline(v=80000, col='red', lwd=2)
+plot(inact_obj$percent.mt ~ inact_obj$nCount_RNA, xlab = '', ylab = 'percent.mt', pch =16)
+abline(h=20, col='red', lwd=2)
+plot(inact_obj$nFeature_RNA ~ inact_obj$nCount_RNA, xlab = 'nCount RNA (Control)', ylab = 'n_features', pch =16)
+abline(h=200, col='red', lwd=2)
+
+dev.off()
+
+nfeature = 200
+mt_percent = 20
+max_count = 80000
+min_count = 10000
+
+act_tokeep = which(act_obj$nFeature_RNA > nfeature & act_obj$percent.mt < mt_percent & act_obj$nCount_RNA < max_count & act_obj$nCount_RNA > min_count)
+inact_tokeep = which(inact_obj$nFeature_RNA > nfeature & inact_obj$percent.mt < mt_percent & inact_obj$nCount_RNA < max_count & inact_obj$nCount_RNA > min_count)
+
+Activ <- CreateSeuratObject(sce_act[,act_tokeep], project = pid, min.cells = 3)
+Inactiv <- CreateSeuratObject(counts = sce_inact[,inact_tokeep], project = 'Control', min.cells = 3)
+
+Activ = SCTransform(Activ)
+Inactiv = SCTransform(Inactiv)
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+# 
+s.gene = readRDS('/mnt/Commun/sc_Induction/Donnees/s.gene.Rds')
+g2m.gene = readRDS('/mnt/Commun/sc_Induction/Donnees/g2m.gene.Rds')
+
+cols_cycle <- c("S" = "orange", "G2M" = "darkolivegreen2", "G1" = "lightblue")
+
+#pdf('/mnt/Commun/sc_Induction/DNArep/Filters/Cell_cycle_norm.pdf')
+CC_act <- CellCycleScoring(object = Activ, s.features = s.gene, g2m.features = g2m.gene, set.ident = TRUE)
+CC_inact <- CellCycleScoring(object = Inactiv, s.features = s.gene, g2m.features = g2m.gene, set.ident = TRUE)
+CC_act.pca <- RunPCA(CC_act, features = c(s.genes, g2m.genes))
+CC_inact.pca <- RunPCA(CC_inact, features = c(s.genes, g2m.genes))
+# DimPlot(CC_act.pca, cols = cols_cycle) + ggtitle(sprintf("Before Cell Cycle Norm (%s)", pid))
+# DimPlot(CC_inact.pca, cols = cols_cycle) + ggtitle("Before Cell Cycle Norm (Control)")
+
+Activ <- SCTransform(CC_act, vars.to.regress = c("S.Score", "G2M.Score")) 
+Inactiv <- SCTransform(CC_inact, vars.to.regress = c("S.Score", "G2M.Score"))
+pca_act <- RunPCA(Activ, features = c(s.gene, g2m.gene))
+pca_inact <- RunPCA(Inactiv, features = c(s.gene, g2m.gene))
+# DimPlot(pca_act, cols = cols_cycle) + ggtitle(sprintf("After Cell Cycle Norm (%s)", pid))
+# DimPlot(pca_inact, cols = cols_cycle) + ggtitle("After Cell Cycle Norm (Control)")
+# 
+# dev.off()
+
+g = intersect(rownames(Activ), rownames(Inactiv))
+both = cbind(Inactiv@assays[["SCT"]]@counts[g,], Activ@assays[["SCT"]]@counts[g,])
+
+#Remove all zero after normalisation
+both = both[-which(apply(both, 1, sum)==0),]
+g = rownames(both)
+
+isActiv <- rep(0:1, c(ncol(Inactiv), ncol(Activ)))
+activStr <- as.factor(rep(c("inactive","active"), c(ncol(Inactiv), ncol(Activ))))
+
+# filtered data for scvelo
+Inact = as.matrix(Inactiv@assays[["SCT"]]@counts[g,])
+colnames(Inact) = gsub('_inactiv', '_Control', colnames(Inact))
+Act = as.matrix(Activ@assays[["SCT"]]@counts[g,])
+colnames(Act) = gsub('_activ', sprintf('_%s', pid), colnames(Act))
+# write.csv(Inact, 'Ctrl_filtered.csv')
+# write.csv(Act, sprintf('%s_filtered.csv',pid))
+```
+
+### Import bootstraps
+
+```{r}
+Boots = list()
+Boot = paste('boot', seq(1:20), sep='')
+
+for (b in 1:20){
+   Boots[[b]] = read.csv(sprintf('/mnt/Commun/sc_Induction/%s/SCENT/Bootstraps/Boot%i_%s.csv',pid,  b, pid))[,2]
+}
+```
+
+### Best Paramaters
+
+```{r}
+Best_Param = function(g, ntop, shared, id1, id2, col1, col2){
+   All_param = list()
+
+   for( b in 1:length(Boot)){
+      boots = c()
+      parametre = Wstat = pvalue = c()
+      pdf(sprintf('/mnt/Commun/sc_Induction/%s/SCENT/%s/Distribution_PseudoT.pdf', pid, g))
+
+      for (n in ntop){
+         for (s in shared){
+            print(c(n, s))
+            PseudoT = read.csv(sprintf('/mnt/Commun/sc_Induction/%s/SCENT/%s/boot%i/Pseudotimes_%s_%i_%i.csv', pid, g, b, g, n, s ))
+            PseudoT_ctrl = PseudoT[grep(id1, PseudoT$X),]
+            PseudoT_act = PseudoT[grep(id2, PseudoT$X),]
+            par(mfrow = c(2,1))
+            hist(PseudoT_ctrl$velocity_pseudotime, xlim =c(0,1), breaks = 100, col=col1, xlab = '', main= sprintf('Pseudotimes (%s) [%i_%i]', id1, n, s))
+            abline(v=mean(PseudoT_ctrl$velocity_pseudotime), col = 'red',lwd=2)
+            hist(PseudoT_act$velocity_pseudotime, xlim =c(0,1), breaks = 100, col=col2, main=sprintf('Pseudotimes (%s) [%i_%i]', id2, n, s), xlab='')
+            abline(v=mean(PseudoT_act$velocity_pseudotime), col = 'red',lwd=2)
+
+            Wstat = c(Wstat, as.vector(wilcox.test(PseudoT_act$velocity_pseudotime, PseudoT_ctrl$velocity_pseudotime)$statistic))
+
+            pvalue = c(pvalue, as.vector(wilcox.test(PseudoT_ctrl$velocity_pseudotime, PseudoT_act$velocity_pseudotime)$p.value))
+            parametre = c(parametre, paste(n, s, sep='_'))
+            boots = c(boots, Boot[b])
+         }
+      }
+
+      pseudoT_Wilcox = data.frame(Bootstraps = boots, Parametres = parametre, W_stat = Wstat, p_value= pvalue)
+      All_param[[b]] = pseudoT_Wilcox
+      dev.off()
+   }
+
+   return(ldply(lapply(All_param, function(w) as.data.frame(w)), rbind))
+}
+```
+
+```{r, include = FALSE, echo = FALSE}
+id1 = 'Control' #Control
+id2 = pid
+G = 'GOrep'
+ntop = c(50,75,100,125, 150, 225, 250, 275,300, 350, 400, 450, 500)
+shared = c(25,50,75,100)
+
+setwd(sprintf('/mnt/Commun/sc_Induction/%s/SCENT/%s',pid,  G))
+
+param = Best_Param(G, ntop, shared, id1, id2, 'grey', color)
+write.csv(param, 'All_param_W.csv')
+
+param = read.csv(sprintf('/mnt/Commun/sc_Induction/%s/SCENT/%s/All_param_W.csv', pid, G))
+
+Comb_parameters = unique(param$Parametres)
+
+W_l = list()
+
+for (b in 1:length(Boot)){
+   W = c()
+   print(sprintf('Bootstrap %s', b))
+   for (i in 1:length(Comb_parameters)){
+      p = Comb_parameters[i]
+      print(p)
+      par = max(param[which(param$Parametres == p),][b,'W_stat'])
+      W = c(W,par)
+   }
+   W_l[[b]] = W
+}
+names(W_l) = Boot
+
+IDx_max_Wtot = lapply(W_l, function(x) which(x == max(x))[1])
+
+Best_param_per_boot = Comb_parameters[unlist(IDx_max_Wtot)]
+
+setwd(sprintf('/mnt/Commun/sc_Induction/%s/SCENT/%s/',pid, G))
+write.csv(Best_param_per_boot, 'Best_param_per_boot.csv')
+
+```
+
+### AUCell Prediction
+
+```{r, include=FALSE,echo=FALSE}
+Boot = paste('Boot', seq(1:20), sep='')
+s_AUCell = c(0.05, 0.1, 0.15, 0.2)
+ncores = 8
+FCTHRESHOLD <- log2(1.5)
+seuil_FDR <- 0.05
+
+seuil_AUCell = list()
+all_seuil_AUCell = list()
+
+
+gset_ID_v = c('HM'
+              #'GOrep', 'GOdam', 'HMGOrep', 'HMGOdam', 'GOrepGOdam' , 'HMGOrepGOdam'
+,'Drivers_HM')#, 'Drivers_GOdam', 'Drivers_HMGOdam')
+
+# gset_ID_v = 'spls'
+
+for (id in 1:length(gset_ID_v)){
+   gset_ID = gset_ID_v[id]
+   print(gset_ID)
+   
+   for (s in 1 : length(s_AUCell)){
+      aucell.v <- c()
+      
+      for (b in 1:length(Boot)){
+         print(sprintf("Bootstrap randomisation: n=%d", b))
+
+         # if (gset_ID == 'spls'){
+         #    gset = spls_inact_DNArep
+         # }
+         
+         if (gset_ID == 'Drivers_HM'){
+            Drivers = read.csv(sprintf('/mnt/Commun/sc_Induction/%s/SCENT/HM/all_drivers_HM_boot%i.csv',pid, b-1))#[,"Gene"]
+            colnames(Drivers)
+            if (sprintf("%s_2.corr", pid) %in% colnames(Drivers)){
+               colnames(Drivers)[which(colnames(Drivers) == sprintf("%s_2.corr", pid))] = sprintf('%s.corr', pid)
+            }
+            if (sprintf("%s_2.qval", pid) %in% colnames(Drivers)){
+               colnames(Drivers)[which(colnames(Drivers) == sprintf("%s_2.qval", pid))] = sprintf('%s.qval', pid)
+            }
+
+            Drivers = Drivers[which(Drivers[,sprintf('%s.qval', pid)] < 0.05 & Drivers[,sprintf('%s.corr', pid)] >0),]
+            gset = Drivers[which(Drivers[,sprintf('%s.qval', pid)] < 0.05 & Drivers[,sprintf('%s.corr', pid)] >0),"Gene"]
+         }
+
+         # if (gset_ID == 'Drivers_GOdam'){
+         #    Drivers = read.csv(sprintf('/mnt/Commun/sc_Induction/%s/SCENT/GOdam/all_drivers_GOdam_boot%i.csv',pid, b-1))
+         #    if (sprintf("%s_2.corr", pid) %in% colnames(Drivers)){
+         #       colnames(Drivers)[which(colnames(Drivers) == sprintf("%s_2.corr", pid))] = sprintf('%s.corr', pid)
+         #    }
+         #    if (sprintf("%s_2.qval", pid) %in% colnames(Drivers)){
+         #       colnames(Drivers)[which(colnames(Drivers) == sprintf("%s_2.qval", pid))] = sprintf('%s.qval', pid)
+         #    }
+         #    Drivers = Drivers[which(Drivers[,sprintf('%s.qval', pid)] < 0.05 & Drivers[,sprintf('%s.corr', pid)] >0),]
+         #    gset = Drivers[which(Drivers[,sprintf('%s.qval', pid)] < 0.05 & Drivers[,sprintf('%s.corr', pid)] >0),"Gene"]
+         # }
+         # 
+         # if (gset_ID == 'Drivers_HMGOdam'){
+         #    Drivers = read.csv(sprintf('/mnt/Commun/sc_Induction/%s/SCENT/HMGOdam/all_drivers_HMGOdam_boot%i.csv',pid, b-1))
+         #    if (sprintf("%s_2.corr", pid) %in% colnames(Drivers)){
+         #       colnames(Drivers)[which(colnames(Drivers) == sprintf("%s_2.corr", pid))] = sprintf('%s.corr', pid)
+         #    }
+         #    if (sprintf("%s_2.qval", pid) %in% colnames(Drivers)){
+         #       colnames(Drivers)[which(colnames(Drivers) == sprintf("%s_2.qval", pid))] = sprintf('%s.qval', pid)
+         #    }
+         #    Drivers = Drivers[which(Drivers[,sprintf('%s.qval', pid)] < 0.05 & Drivers[,sprintf('%s.corr', pid)] >0),]
+         #    gset = Drivers[which(Drivers[,sprintf('%s.qval', pid)] < 0.05 & Drivers[,sprintf('%s.corr', pid)] >0),"Gene"]
+         # }
+         
+         if (gset_ID == 'HM'){
+            gset = HM_OverExp
+         }
+         
+         # if (gset_ID == 'GOrep') {
+         #    gset = GOrep_OverExp
+         # }
+         # 
+         # if (gset_ID == 'GOdam') {
+         #    gset = GOdam_OverExp
+         # }
+         # 
+         # if (gset_ID == 'HMGOrep'){
+         #    gset = unique(c(HM_OverExp, GOrep_OverExp))
+         # }
+         # 
+         # if (gset_ID == 'HMGOdam'){
+         #    gset = unique(c(HM_OverExp, GOdam_OverExp))
+         # }
+         # 
+         # if (gset_ID == 'GOrepGOdam'){
+         #    gset = unique(c(GOrep_OverExp, GOdam_OverExp))
+         # }
+         # 
+         # if (gset_ID == 'HMGOrepGOdam'){
+         #    gset = unique(c(HM_OverExp, GOrep_OverExp, GOdam_OverExp))
+         # }
+         
+         
+         
+         
+         subcells = Boots[[b]]
+
+         subcells = gsub('Control', 'inactiv', subcells)
+         subcells = gsub(pid, 'activ', subcells)
+
+         subcells = which(colnames(both) %in% subcells)
+
+         discov <- both[,subcells]
+         valid <- both[,-subcells]
+         dactiv <- isActiv[subcells]
+         vactiv <- isActiv[-subcells]
+   
+         # AUCell GSEA score
+         geneSets[[activity]]@geneIds <- gset
+         gs <- geneSets[[activity]]
+         score = Score_AUCell(as.matrix(valid[,]), gs, s_AUCell[s])
+         names(score) <- colnames(valid)
+         
+         vdat=data.frame(isActiv=vactiv, Score=score)
+         aucell.roc=roc(isActiv ~ Score, data=vdat, levels=c("0", "1"))
+         aucell.v <- c(aucell.v, auc(aucell.roc))
+      }
+      seuil_AUCell[[s]] = aucell.v
+   }
+names(seuil_AUCell) = s_AUCell
+all_seuil_AUCell[[id]] = seuil_AUCell
+}
+names(all_seuil_AUCell) = gset_ID_v
+
+setwd(sprintf('/mnt/Commun/sc_Induction/%s/', pid))
+
+pdf(sprintf('All_seuil_AUCell_from_%s.pdf',pid))
+
+boxplot(all_seuil_AUCell$HM, ylim = c(0.5,1), ylab = "HM")
+means <- sapply(all_seuil_AUCell$HM, mean)
+for (i in 1:length(means)) {
+  text(x = i, y = means[i] + 0.03, labels = round(means[i], 3), cex = 0.8)
+}
+
+boxplot(all_seuil_AUCell$GOdam, ylim = c(0.5,1), ylab = "GOdam")
+means <- sapply(all_seuil_AUCell$GOdam, mean)
+for (i in 1:length(means)) {
+  text(x = i, y = means[i] + 0.04, labels = round(means[i], 3), cex = 0.8)
+}
+
+boxplot(all_seuil_AUCell$GOrep, ylim = c(0.5,1), ylab = "GOrep")
+means <- sapply(all_seuil_AUCell$GOrep, mean)
+for (i in 1:length(means)) {
+  text(x = i, y = means[i] + 0.04, labels = round(means[i], 3), cex = 0.8)
+}
+
+boxplot(all_seuil_AUCell$Drivers_HM, ylim = c(0.5,1), ylab = "Drivers HM")
+means <- sapply(all_seuil_AUCell$Drivers_HM, mean)
+for (i in 1:length(means)) {
+  text(x = i, y = means[i] + 0.055, labels = round(means[i], 3), cex = 0.8)
+}
+dev.off()
+
+saveRDS(all_seuil_AUCell, 'all_seuil_AUCell.Rds')
+
+```
