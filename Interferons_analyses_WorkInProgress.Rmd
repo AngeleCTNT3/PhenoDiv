@@ -1,0 +1,1107 @@
+---
+title: "Interferons analyses"
+author: "Angèle COUTANT"
+date: "2023-07-31"
+output: html_document
+---
+
+
+```{r, echo=FALSE, include=FALSE}
+library(Seurat)       # Importation des données/Quantification
+library(scater)       # Control Qualité
+library(sctransform)  # Normalisation par seurat
+library(biomaRt)      # Re Annotation des gènes
+library(AUCell) 
+#library(MAST)         # Analyse différentielle
+library(pROC)
+library(ggplot2)
+library(GSEABase)
+library(cowplot)
+library(RColorBrewer)
+library(data.table)
+library(devtools)
+# library(SCENT)
+library(DescTools)
+library(plyr)
+library(reticulate)
+
+source('/mnt/Commun/Single_cell/functions.R')
+```
+
+```{r}
+all_GO = getGmt('/mnt/Commun/sc_Induction/Donnees/c5.go.bp.v2022.1.Hs.symbols.gmt')
+setwd('/mnt/Commun/sc_Induction/IFNs/')
+
+pid <- 'IFNa'
+rainbow_act = c('#339900', '#0066CC', "#E69F00", "#FFCC33", "#990033", "#CC0033")
+
+if (pid == "IFNa"){
+   color = rainbow_act[5]
+   color2 = rainbow_act[6]
+   activity = "HALLMARK_INTERFERON_ALPHA_RESPONSE" 
+   GO = all_GO[["GOBP_RESPONSE_TO_TYPE_I_INTERFERON"]]@geneIds 
+   gmtFile <- "/mnt/Commun/sc_Induction/Donnees/h.all.v6.2.symbols.gmt"
+   geneSets <- getGmt(gmtFile)
+   HM <- geneSets[[activity]]@geneIds
+   mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl", host = "https://dec2021.archive.ensembl.org")
+   HM_list <- getBM(attributes=c('external_synonym', 'hgnc_symbol'), filters= "external_synonym" ,values= HM, mart=mart, uniqueRows=T, useCache = FALSE)
+   HM_list2 <- getBM(attributes=c('external_synonym', 'hgnc_symbol'), filters= 'hgnc_symbol' ,values=HM, mart=mart, uniqueRows=T, useCache = FALSE)
+   HM_list <- rbind(HM_list2, HM_list)
+   HM <- unique(c(HM_list$external_synonym, HM_list$hgnc_symbol))
+}
+
+if (pid == 'IFNg'){
+   color = rainbow_act[6]
+   color2 = rainbow_act[5]
+   GO = all_GO[["GOBP_INTERFERON_GAMMA_MEDIATED_SIGNALING_PATHWAY"]]@geneIds
+   gmtFile <- "/mnt/Commun/sc_Induction/Donnees/h.all.v6.2.symbols.gmt"
+   geneSets <- getGmt(gmtFile)
+   activity = "HALLMARK_INTERFERON_GAMMA_RESPONSE"
+   HM <- geneSets[[activity]]@geneIds
+   mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl", host = "https://dec2021.archive.ensembl.org")
+   HM_list <- getBM(attributes=c('external_synonym', 'hgnc_symbol'), filters= "external_synonym" ,values = HM, mart=mart, uniqueRows=T, useCache = FALSE)
+   HM_list2 <- getBM(attributes=c('external_synonym', 'hgnc_symbol'), filters= 'hgnc_symbol' ,values=HM, mart=mart, uniqueRows=T, useCache = FALSE)
+   HM_list <- rbind(HM_list2, HM_list)
+   HM <- unique(c(HM_list$external_synonym, HM_list$hgnc_symbol))
+}
+
+```
+
+# QC and normalisation
+
+```{r, include=FALSE, echo = FALSE}
+sce_act <- Read10X(data.dir = sprintf('/mnt/Commun/sc_Induction/IFNs/Donnees/%s_feature_bc_matrix/', pid))
+sce_inact <- Read10X(data.dir = sprintf('/mnt/Commun/sc_Induction/IFNs/Donnees/Control_feature_bc_matrix'))
+   
+colnames(sce_act[['Gene Expression']]) <- gsub(' ', '', paste(colnames(sce_act[['Gene Expression']]), '_activ'))
+colnames(sce_inact[['Gene Expression']]) <- gsub(' ', '', paste(colnames(sce_inact[['Gene Expression']]), '_inactiv'))
+
+# Convert in Seurat objet
+act_obj <- CreateSeuratObject(sce_act[['Gene Expression']], project = pid)
+inact_obj <- CreateSeuratObject(sce_inact[['Gene Expression']], project = 'Control')
+
+act_obj[["percent.mt"]] <- PercentageFeatureSet(act_obj, pattern = "^MT-")
+inact_obj[["percent.mt"]] <- PercentageFeatureSet(inact_obj, pattern = "^MT-")
+act_obj[["percent.rb"]] <- PercentageFeatureSet(act_obj, pattern = "^RP[SL]")
+inact_obj[["percent.rb"]] <- PercentageFeatureSet(inact_obj, pattern = "^RP[SL]")
+
+pdf(sprintf('Filters_%s.pdf', pid))
+
+VlnPlot(act_obj, features = c("nFeature_RNA","nCount_RNA","percent.mt","percent.rb"), ncol = 4, pt.size = 0.1) & 
+   theme(plot.title = element_text(size=10))
+boxplot(act_obj$percent.mt, sub = sprintf('percent_mt in %s', pid))
+abline(h=10, col='red')
+
+VlnPlot(inact_obj, features = c("nFeature_RNA","nCount_RNA","percent.mt","percent.rb"),ncol = 4, pt.size = 0.1) & 
+   theme(plot.title = element_text(size=10))
+boxplot(inact_obj$percent.mt, sub = 'percent_mt in Control')
+abline(h=10, col='red')
+
+par(mfrow = c(3,1), mar = c(4, 4, 1, 3))
+
+hist(act_obj$nCount_RNA, breaks = 50, xlab = '', main = '', col = color) 
+abline(v=10000, col = 'red', lwd=2)
+abline(v=80000, col='red', lwd=2)
+plot(act_obj$percent.mt ~ act_obj$nCount_RNA, xlab = '', ylab = 'percent.mt', pch =16)
+abline(h=10, col='red', lwd=2)
+plot(act_obj$nFeature_RNA ~ act_obj$nCount_RNA, xlab = sprintf('nCount RNA',pid), ylab = 'n_features', pch =16)
+abline(h=1000, col='red', lwd=2)
+
+hist(inact_obj$nCount_RNA, breaks = 50 , xlab = '', main ='', col = 'grey') 
+abline(v=10000, col = 'red', lwd=2)
+abline(v=80000, col='red', lwd=2)
+plot(inact_obj$percent.mt ~ inact_obj$nCount_RNA, xlab = '', ylab = 'percent.mt', pch =16)
+abline(h=10, col='red', lwd=2)
+plot(inact_obj$nFeature_RNA ~ inact_obj$nCount_RNA, xlab = 'nCount RNA (Control)', ylab = 'n_features', pch =16)
+abline(h=1000, col='red', lwd=2)
+
+dev.off()
+
+#Parameters
+
+nfeature = 1000
+mt_percent = 10
+max_count = 80000
+min_count = 10000
+
+act_tokeep = which(act_obj$nFeature_RNA > nfeature & act_obj$percent.mt < mt_percent & act_obj$nCount_RNA < max_count & act_obj$nCount_RNA > min_count)
+inact_tokeep = which(inact_obj$nFeature_RNA > nfeature & inact_obj$percent.mt < mt_percent & inact_obj$nCount_RNA < max_count & inact_obj$nCount_RNA > min_count)
+
+Activ <- CreateSeuratObject(counts = sce_act[['Gene Expression']][,act_tokeep], project = pid, min.cells = 3)
+Inactiv <- CreateSeuratObject(counts = sce_inact[['Gene Expression']][,inact_tokeep], project = 'Control', min.cells = 3)
+
+Activ = SCTransform(Activ)
+Inactiv = SCTransform(Inactiv)
+
+##### Normalisation #####
+
+# By cell cycle
+
+# s.genes <- cc.genes$s.genes
+# g2m.genes <- cc.genes$g2m.genes
+#mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+
+
+s.gene = readRDS('/mnt/Commun/sc_Induction/Donnees/s.gene.Rds')
+g2m.gene = readRDS('/mnt/Commun/sc_Induction/Donnees/g2m.gene.Rds')
+
+cols_cycle <- c("S" = "orange", "G2M" = "darkolivegreen2", "G1" = "lightblue")
+
+pdf(sprintf('/mnt/Commun/sc_Induction/IFNs/Cell_cycle_norm_%s.pdf', pid))
+CC_act <- CellCycleScoring(object = Activ, s.features = s.gene, g2m.features = g2m.gene, set.ident = TRUE)
+CC_inact <- CellCycleScoring(object = Inactiv, s.features = s.gene, g2m.features = g2m.gene, set.ident = TRUE)
+CC_act.pca <- RunPCA(CC_act, features = c(s.gene, g2m.gene))
+CC_inact.pca <- RunPCA(CC_inact, features = c(s.gene, g2m.gene))
+DimPlot(CC_act.pca, cols= cols_cycle) + ggtitle(sprintf("Before Cell Cycle Norm (%s)", pid))
+DimPlot(CC_inact.pca, cols= cols_cycle) + ggtitle("Before Cell Cycle Norm (Control)")
+
+Activ <- SCTransform(CC_act, vars.to.regress = c("S.Score", "G2M.Score")) 
+Inactiv <- SCTransform(CC_inact, vars.to.regress = c("S.Score", "G2M.Score"))
+pca_act <- RunPCA(Activ, features = c(s.gene, g2m.gene))
+pca_inact <- RunPCA(Inactiv, features = c(s.gene, g2m.gene))
+DimPlot(pca_act, cols= cols_cycle) + ggtitle(sprintf("After Cell Cycle Norm (%s)", pid))
+DimPlot(pca_inact, cols= cols_cycle) + ggtitle("After Cell Cycle Norm (Control)")
+
+dev.off()
+
+# write.csv(Activ@assays[["SCT"]]@counts, sprintf('%s_filtered.csv', pid))
+# write.csv(Inactiv@assays[["SCT"]]@counts, 'Control_filtered.csv')
+
+```
+
+
+```{r}
+
+comb = 'Normal' #MixtCtrl
+
+if (comb != "Mixt_Ctrl"){
+   setwd('/mnt/Commun/sc_Induction/IFNs/Donnees/')
+   g = intersect(rownames(Activ), rownames(Inactiv))
+   both = cbind(Inactiv@assays[["SCT"]]@counts[g,], Activ@assays[["SCT"]]@counts[g,])
+   
+   #Remove all zero after normalisation
+   both = both[-which(apply(both, 1, sum)==0),]
+   g = rownames(both)
+
+   isActiv <- rep(0:1, c(ncol(Inactiv), ncol(Activ)))
+   activStr <- as.factor(rep(c("inactive","active"), c(ncol(Inactiv), ncol(Activ))))
+   
+   # filtered data for scvelo
+   Inact = as.matrix(Inactiv@assays[["SCT"]]@counts[g,])
+   colnames(Inact) = gsub('_inactiv', '_Control', colnames(Inact))
+   Act = as.matrix(Activ@assays[["SCT"]]@counts[g,])
+   colnames(Act) = gsub('_activ', sprintf('_%s', pid), colnames(Act))
+   # write.csv(Inact, 'Ctrl_filtered.csv')
+   # write.csv(Act, sprintf('%s_filtered.csv',pid))
+}
+
+if (comb == 'Mixt_Ctrl'){
+   if (pid == 'IFNa'){
+      Ctrl = read.csv('/mnt/Commun/sc_Induction/IFNs/Donnees/Control_filtered.csv')
+      Ctrl2 = read.csv('/mnt/Commun/sc_Induction/IFNs/Donnees/IFNg_filtered.csv')
+      rownames(Ctrl) = Ctrl$X
+      rownames(Ctrl2) = Ctrl2$X
+      Ctrl = Ctrl[,-1]
+      Ctrl2 = Ctrl2[,-1]
+      common_genes = intersect(rownames(Ctrl), rownames(Ctrl2))
+      Inactiv = cbind(Ctrl[common_genes,], Ctrl2[common_genes,])
+      colnames(Inactiv) = gsub('.1_IFNg','-1_inactiv', colnames(Inactiv))
+      colnames(Inactiv) = gsub('.1_Control','-1_inactiv', colnames(Inactiv))
+   }
+
+   if (pid == 'IFNg'){
+      Ctrl = read.csv('/mnt/Commun/sc_Induction/IFNs/Donnees/Control_filtered.csv')
+      Ctrl2 = read.csv('/mnt/Commun/sc_Induction/IFNs/Donnees/IFNa_filtered.csv')
+      rownames(Ctrl) = Ctrl$X
+      rownames(Ctrl2) = Ctrl2$X
+      Ctrl = Ctrl[,-1]
+      Ctrl2 = Ctrl2[,-1]
+      common_genes = intersect(rownames(Ctrl), rownames(Ctrl2))
+      Inactiv = cbind(Ctrl[common_genes,], Ctrl2[common_genes,])
+      colnames(Inactiv) = gsub('.1_IFNa','-1_inactiv', colnames(Inactiv))
+      colnames(Inactiv) = gsub('.1_Control','-1_inactiv', colnames(Inactiv))
+   }
+   g = intersect(rownames(Activ), rownames(Inactiv))
+   both = cbind(Inactiv[g,], as.matrix(Activ@assays[["SCT"]]@data)[g,])
+}
+
+
+isActiv <- rep(0:1, c(ncol(Inactiv), ncol(Activ)))
+activStr <- as.factor(rep(c("inactive","active"), c(ncol(Inactiv), ncol(Activ))))
+
+```
+
+```{python}
+import matplotlib
+import numpy as np
+import pandas as pd
+import scvelo as scv
+import scanpy as sc
+import csv
+
+from scanpy import read
+import cellrank as cr
+from random import sample
+import os
+os.getcwd()
+os.chdir('/mnt/Commun/sc_Induction/IFNs/SCENT/')
+os.getcwd()
+
+# Import genes set
+
+HM_IFNa =[]
+with open('/mnt/Commun/sc_Induction/IFNs/Donnees/HM_IFNa.csv') as IFNaHMcsv:
+    IFNaHM = csv.reader(IFNaHMcsv, delimiter=',', quotechar='"')
+    for row in IFNaHM:
+        HM_IFNa.append(''.join(row))
+        
+GO_IFNa =[]
+with open('/mnt/Commun/sc_Induction/IFNs/Donnees/GO_IFNa.csv') as IFNaGOcsv:
+    IFNaGO = csv.reader(IFNaGOcsv, delimiter=',', quotechar='"')
+    for row in IFNaGO:
+        GO_IFNa.append(''.join(row))
+
+HM_IFNg =[]
+with open('/mnt/Commun/sc_Induction/IFNs/Donnees/HM_IFNg.csv') as IFNgHMcsv:
+    IFNgHM = csv.reader(IFNgHMcsv, delimiter=',', quotechar='"')
+    for row in IFNgHM:
+        HM_IFNg.append(''.join(row))
+               
+GO_IFNg =[]
+with open('/mnt/Commun/sc_Induction/IFNs/Donnees/GO_IFNg.csv') as IFNgGOcsv:
+    IFNgGO = csv.reader(IFNgGOcsv, delimiter=',', quotechar='"')
+    for row in IFNgGO:
+        GO_IFNg.append(''.join(row))
+
+
+g = 'HM_IFNg'
+genes = HM_IFNg
+pid = 'IFNg'
+
+Ctrl = read(f'/mnt/Commun/sc_Induction/IFNs/Donnees/Control.loom', sparse=True, cache=True)
+IFNa = read(f'/mnt/Commun/sc_Induction/IFNs/Donnees/IFNa.loom', sparse=True, cache=True)
+IFNg = read(f'/mnt/Commun/sc_Induction/IFNs/Donnees/IFNg.loom', sparse=True, cache=True)
+
+Ctrl.var_names_make_unique()
+IFNa.var_names_make_unique()
+IFNg.var_names_make_unique()
+
+cell_Ctrl = []
+cell_IFNa = []
+cell_IFNg = []
+
+for i in Ctrl.obs_names :
+    i = i.replace('CTL:', '')
+    i = i.replace('x', '-1_Control')
+    cell_Ctrl.append(i)
+    
+for i in IFNa.obs_names :
+    i = i.replace('IFNA:', '')
+    i = i.replace('x', f'-1_IFNa')
+    cell_IFNa.append(i)
+
+for i in IFNg.obs_names :
+    i = i.replace('IFNG:', '')
+    i = i.replace('x', f'-1_IFNg')
+    cell_IFNg.append(i)
+    
+Ctrl.obs_names = cell_Ctrl
+IFNa.obs_names = cell_IFNa
+IFNg.obs_names = cell_IFNg
+
+### Importation des données filtrées
+
+with open ('/mnt/Commun/sc_Induction/IFNs/Donnees/Control_filtered.csv', newline = '') as f_ctrl:
+    ctrl_filter = csv.reader(f_ctrl)
+    cell_ctrl_filter = next(ctrl_filter)[1:]
+    
+with open (f'/mnt/Commun/sc_Induction/IFNs/Donnees/IFNa_filtered.csv', newline = '') as f_IFNa:
+    IFNa_filter = csv.reader(f_IFNa)
+    cell_IFNa_filter = next(IFNa_filter)[1:]
+    
+    
+with open ('/mnt/Commun/sc_Induction/IFNs/Donnees/IFNg_filtered.csv', newline = '') as f_IFNg:
+    IFNg_filter = csv.reader(f_IFNg)
+    cell_IFNg_filter = next(IFNg_filter)[1:]
+
+cells_ctrl_filter = []
+for i in cell_ctrl_filter:
+    i=i.replace('.1_', '-1_')
+    cells_ctrl_filter.append(i)
+    
+    
+cells_IFNg_filter = []
+for i in cell_IFNg_filter:
+    i=i.replace('.1_', '-1_')
+    cells_IFNg_filter.append(i)
+    
+cells_IFNa_filter = []
+for i in cell_IFNa_filter:
+    i=i.replace('.1_', '-1_')
+    cells_IFNa_filter.append(i)
+    
+    
+Ctrl_filtered = Ctrl[Ctrl.obs_names.isin(cells_ctrl_filter), Ctrl.var_names.isin(genes)]
+IFNa_filtered = IFNa[IFNa.obs_names.isin(cells_IFNa_filter), IFNa.var_names.isin(genes)]
+IFNg_filtered = IFNg[IFNg.obs_names.isin(cells_IFNg_filter), IFNg.var_names.isin(genes)]
+
+### Creation des bootstraps
+
+# Ici, pour faciliter les analyses : avoir pour chaque bootstrap Glyco et Oxphos les memes cellules controles
+
+#nboots = 20
+#boots = list(range(nboots))
+#per = 0.5
+
+#for b in range(nboots):
+    #os.chdir(f'/mnt/Commun/sc_Induction/IFNs/SCENT/Bootstraps/')
+    #os.getcwd()
+    #Ctrl_data = Ctrl_filtered[Ctrl_filtered.obs_names, Ctrl_filtered.var_names]
+    #IFNa_data = IFNa_filtered[IFNa_filtered.obs_names, IFNa_filtered.var_names]
+
+    #Discovery/Validation set
+    #IFNa_disc = sample(list(IFNa_data.obs_names), int(per*len(IFNa_data.obs_names)))
+    #Ctrl_disc = sample(list(Ctrl_data.obs_names), int(per*len(Ctrl_data.obs_names)))
+    #boots[b] = IFNa_disc + Ctrl_disc
+    #df_IFNa = pd.DataFrame(boots[b])
+    #df_IFNa.to_csv(f'boot{b+1}_IFNa_Ctrl.csv')
+
+    #os.chdir(f'/mnt/Commun/sc_Induction/IFNs/SCENT/Bootstraps/')
+    #os.getcwd()
+
+    #IFNg_data = IFNg_filtered[IFNg_filtered.obs_names, IFNg_filtered.var_names]
+    #IFNg_disc = sample(list(IFNg_data.obs_names), int(per*len(IFNg_data.obs_names)))
+    #boots[b] = IFNg_disc + Ctrl_disc
+    #df_IFNg = pd.DataFrame(boots[b])
+    #df_IFNg.to_csv(f'boot{b+1}_IFNg_Ctrl.csv')
+
+    #boots[b] = IFNg_disc + IFNa_disc
+    #df_IFNg_IFNa = pd.DataFrame(boots[b])
+    #df_IFNg_IFNa.to_csv(f'boot{b+1}_IFNg_IFNa.csv')
+    
+    #boots[b] = Ctrl_disc + IFNg_disc + IFNa_disc
+    #df_IFNg_IFNa_Ctrl = pd.DataFrame(boots[b])
+    #df_IFNg_IFNa_Ctrl.to_csv(f'boot{b+1}_IFNg_IFNa_Ctrl.csv')
+    
+#Import bootstraps
+
+nboots = 20
+Boots_A_Ctrl = list(range(nboots))
+Boots_G_Ctrl = list(range(nboots))
+Boots_G_A = list(range(nboots))
+Boots_G_A_Ctrl = list(range(nboots))
+
+for b in range(nboots):
+    Row = []
+    with open(f'/mnt/Commun/sc_Induction/IFNs/SCENT/Bootstraps/boot{b+1}_IFNa_Ctrl.csv') as Bootscsv:
+        Boot = csv.reader(Bootscsv, delimiter=',', quotechar='"')
+        next(Boot)
+        for row in Boot:
+            row = row[1]
+            Row.append(''.join(row))
+            Boots_A_Ctrl[b] = Row
+
+for b in range(nboots):
+    Row = []
+    with open(f'/mnt/Commun/sc_Induction/IFNs/SCENT/Bootstraps/boot{b+1}_IFNg_Ctrl.csv') as Bootscsv:
+        Boot = csv.reader(Bootscsv, delimiter=',', quotechar='"')
+        next(Boot)
+        for row in Boot:
+            row = row[1]
+            Row.append(''.join(row))
+            Boots_G_Ctrl[b] = Row
+            
+for b in range(nboots):
+    Row = []
+    with open(f'/mnt/Commun/sc_Induction/IFNs/SCENT/Bootstraps/boot{b+1}_IFNg_IFNa.csv') as Bootscsv:
+        Boot = csv.reader(Bootscsv, delimiter=',', quotechar='"')
+        next(Boot)
+        for row in Boot:
+            row = row[1]
+            Row.append(''.join(row))
+            Boots_G_A[b] = Row
+
+for b in range(nboots):
+    Row = []
+    with open(f'/mnt/Commun/sc_Induction/IFNs/SCENT/Bootstraps/boot{b+1}_IFNg_IFNa_Ctrl.csv') as Bootscsv:
+        Boot = csv.reader(Bootscsv, delimiter=',', quotechar='"')
+        next(Boot)
+        for row in Boot:
+            row = row[1]
+            Row.append(''.join(row))
+            Boots_G_A_Ctrl[b] = Row
+            
+cond = "3pop"
+ntop = (15,20) 
+shared = (25,50,75,100)
+
+ 
+if (cond == "Ctrl_IFNa"):
+    Boots = Boots_A_Ctrl
+    id1 = "Ctrl"
+    id2 = "IFNa"
+    col1 = "grey"
+    col2 = "#990033"
+    data1 = Ctrl_filtered
+    data2 = IFNa_filtered
+
+if (cond == "Ctrl_IFNg"):
+    Boots = Boots_G_Ctrl
+    id1 = "Ctrl"
+    id2 = "IFNg"
+    col1 = "grey"
+    col2 = "#CC0033"
+    data1 = Ctrl_filtered
+    data2 = IFNg_filtered
+
+if (cond == "IFNa_IFNg"):
+    Boots = Boots_G_A
+    id1 = "IFNg"
+    id2 = "IFNa"
+    data1 = IFNg_filtered
+    data2 = IFNa_filtered
+    col1 = "#CC0033"
+    col2 = "#990033"
+
+if (cond == "3pop"):
+    Boots = Boots_G_A_Ctrl
+    id1 = "Control"
+    id2 = "IFNg"
+    id3 = "IFNa"
+    data1 = Ctrl_filtered
+    data2 = IFNg_filtered
+    data3 = IFNa_filtered
+    col1 = "grey"
+    col2 = "#CC0033"
+    col3 = "#990033"
+    
+def PseudoT(g, d1, d2, id1, id2, cond, col1, col2):
+    for b in range(nboots) :
+        print("###########################################################")
+        print("Bootstrap n°",b+1)
+        print("ntop=", n)
+        print("shared=", s)
+        print("###########################################################")
+
+
+        os.chdir(f'/mnt/Commun/sc_Induction/IFNs/SCENT/{g}/{cond}/boot{b+1}/')
+        os.getcwd()
+
+        data_1 = d1[d1.obs_names.isin(Boots[b]),]
+        data_2 = d2[d2.obs_names.isin(Boots[b]),]
+        both = data_1.concatenate(data_2)
+
+        D1D2 = []
+        for i in both.obs_names :
+            i = i.replace(f'{id1}-0', f'{id1}')
+            i = i.replace(f'{id2}-1', f'{id2}')
+            D1D2.append(i)
+        both.obs_names = D1D2
+
+        both.obs["induct"] = np.repeat([id1,id2], [data_1.shape[0], data_2.shape[0]], axis=0)
+        scv.pp.filter_and_normalize(both, min_shared_counts=s, n_top_genes=n)
+
+        data = both
+
+        scv.pp.moments(data)
+        scv.tl.umap(data, min_dist=1)
+        scv.plotting.umap(data, color="induct",palette=(col1, col2), save=f"UMAP_{g}_{n}_{s}.png")
+
+        scv.tl.velocity(data)
+        scv.pp.neighbors(data)
+        scv.tl.velocity_graph(data)
+        scv.pl.velocity_embedding_stream(data , basis='umap', color='induct',palette=(col1, col2), save=f"Velocity_{g}_{n}_{s}.png")
+
+        scv.tl.paga(data, groups='induct')
+        scv.pl.paga(data, basis = "umap", palette=(col1, col2),  save = f"UMAP_paga_{g}_{n}_{s}.png")
+
+        pseudo_time = scv.tl.velocity_pseudotime(data)
+        scv.pl.scatter(data, color='velocity_pseudotime', color_map='gnuplot', save = f'Pseudotime_{cond}_ntop{n}_shared{s}_{g}.pdf')
+        Pseudotime_value = pd.DataFrame(data.obs['velocity_pseudotime'])
+        Pseudotime_value.to_csv(f'Pseudotimes_{cond}_{g}_{n}_{s}.csv')
+        
+# Measure of pseudotimes for each couple of parameters
+
+for n in ntop:
+    for s in shared:
+        PseudoT(g, data1, data2, id1, id2, cond, col1, col2)
+        
+### Select best param per boot
+
+Best_param_per_boot=[]
+with open(f'/mnt/Commun/sc_Induction/IFNs/SCENT/{g}/Best_param_per_boot.csv') as Bootscsv:
+    Boot = csv.reader(Bootscsv, delimiter=',', quotechar='"')
+    next(Boot)
+    for row in Boot:
+        row = row[1]
+        Best_param_per_boot.append(''.join(row))
+
+os.chdir(f'/mnt/Commun/sc_Induction/IFNs/SCENT/{g}/{cond}')
+os.getcwd()
+
+for b in range(len(Best_param_per_boot)) :
+
+    print(b)
+    n = int(Best_param_per_boot[b].split('_')[0])
+    s = int(Best_param_per_boot[b].split('_')[1])
+
+    d1_d2 = data1.concatenate(data2)
+    both = d1_d2.concatenate(data3)
+
+    both.obs["induct"] = np.repeat([id1,id2, id3], [data1.shape[0], data2.shape[0], data3.shape[0]], axis=0)
+
+    #scv.pp.filter_and_normalize(d1_d2_d3, min_shared_counts=s, n_top_genes=n)
+    scv.pp.filter_and_normalize(both, min_shared_counts=s, n_top_genes=n)
+
+    data = both
+
+    scv.pp.moments(data)
+    scv.tl.umap(data, min_dist=1)
+    scv.plotting.umap(data, color="induct",palette=(col1, col2, col3), save=f"UMAP_{g}_{n}_{s}_boot{b}.png")
+
+    scv.tl.velocity(data)
+    scv.tl.velocity_graph(data)
+    scv.pl.velocity_embedding_stream(data , basis='umap', color='induct',palette=(col1, col2, col3), save=f"Velocity_{g}_{n}_{s}_boot{b}.png")
+
+    cr.tl.initial_states(data , cluster_key="induct", n_states=1)
+    cr.pl.initial_states(data , discrete=True, save=f"Initial_state_{g}_{n}_{s}_boot{b}.png")
+
+    cr.tl.terminal_states(data , cluster_key="induct",  n_states=3,  weight_connectivities=0.2)
+    cr.pl.terminal_states(data , discrete=True, save=f"Terminal_states_{g}_{n}_{s}_boot{b}.png")
+
+    scv.tl.paga(data, groups='induct')
+    scv.pl.paga(data, basis = "umap", palette=(col1,col2, col3), save=f"UMAP_paga_{g}_{n}_{s}_boot{b}.png")
+
+    scv.tl.velocity_pseudotime(data)
+    cr.tl.lineages(data)
+    cr.pl.lineages(data, save=f'lineage_3pop_{g}_{n}_{s}_boot{b}.png')
+
+    cr.pl.lineages(data, same_plot=False, save=f'lineage_3pop_bis_{g}_{n}_{s}_boot{b}.png')
+
+    drivers = cr.tl.lineage_drivers(data)
+    drivers.to_csv(f'all_drivers_{g}_boot{b}.csv')
+    #cr.pl.lineage_drivers(data, lineage="Glycolyse", n_genes=20, save=f"Glyco_drivers_3pop_boot{b}.pdf")
+    #cr.pl.lineage_drivers(data, lineage="OxPhos", n_genes=20, save=f"Oxphos_drivers_3pop_boot{b}.pdf")  
+    
+    
+##############################################
+#              Without bootstrap             #
+##############################################
+
+ntop = (15,20, 25)
+shared = (25,50,75,100)
+os.chdir(f'/mnt/Commun/sc_Induction/IFNs/SCENT/{g}/Without_boot')
+os.getcwd()
+
+cond = 'Ctrl_IFNg'
+
+if (cond == "Ctrl_IFNa"):
+    id1 = "Ctrl"
+    id2 = 'IFNa'
+    col1 = "grey"
+    col2 = "#990033"
+    data1 = Ctrl_filtered
+    data2 = IFNa_filtered
+
+if (cond == "Ctrl_IFNg"):
+    id1 = "Ctrl"
+    id2 = "IFNg"
+    col1 = "grey"
+    col2 = "#CC0033"
+    data1 = Ctrl_filtered
+    data2 = IFNg_filtered
+
+if (cond == "IFNa_IFNg"):
+    id1 = "IFNg"
+    id2 = "IFNa"
+    data1 = IFNg_filtered
+    data2 = IFNa_filtered
+    col1 = "#CC0033"
+    col2 = "#990033"
+    
+    
+os.chdir(f'/mnt/Commun/sc_Induction/IFNs/SCENT/{g}/Without_boot/{cond}')
+os.getcwd()
+
+for n in ntop:
+    for s in shared:
+        print("ntop=", n)
+        print("shared=", s)
+        os.chdir(f'/mnt/Commun/sc_Induction/IFNs/SCENT/{g}/Without_boot/{cond}')
+        os.getcwd()
+
+        both = data1.concatenate(data2)
+
+        D1D2 = []
+        for i in both.obs_names :
+            i = i.replace(f'{id1}-0', f'{id1}')
+            i = i.replace(f'{id2}-1', f'{id2}')
+            D1D2.append(i)
+        both.obs_names = D1D2
+
+        both.obs["induct"] = np.repeat([id1,id2], [data1.shape[0], data2.shape[0]], axis=0)
+        scv.pp.filter_and_normalize(both, min_shared_counts=s, n_top_genes=n)
+
+        data = both
+
+        scv.pp.moments(data)
+        scv.tl.umap(data, min_dist=1)
+        scv.plotting.umap(data, color="induct",palette=(col1, col2), save=f"UMAP_{g}_{n}_{s}.png")
+
+        scv.tl.velocity(data)
+        scv.pp.neighbors(data)
+        scv.tl.velocity_graph(data)
+        scv.pl.velocity_embedding_stream(data , basis='umap', color='induct',palette=(col1, col2), save=f"Velocity_{g}_{n}_{s}.png")
+
+        scv.tl.paga(data, groups='induct')
+        scv.pl.paga(data, basis = "umap", palette=(col1, col2),  save = f"UMAP_paga_{g}_{n}_{s}.png")
+
+        pseudo_time = scv.tl.velocity_pseudotime(data)
+        scv.pl.scatter(data, color='velocity_pseudotime', color_map='gnuplot', save = f'Pseudotime_ntop{n}_shared{s}_{g}.pdf')
+        Pseudotime_value = pd.DataFrame(data.obs['velocity_pseudotime'])
+        Pseudotime_value.to_csv(f'Pseudotimes_{g}_{n}_{s}.csv')
+        
+# Once the best parameters have been identified for each condition, drivers genes are searched for from three combined populations.
+
+n = 25
+s = 50
+
+os.chdir(f'/mnt/Commun/sc_Induction/IFNs/SCENT/{g}/Without_boot/3pop')
+os.getcwd()
+        
+both = Ctrl_filtered.concatenate(IFNa_filtered)
+both = both.concatenate(IFNg_filtered)
+
+both.obs["induct"] = np.repeat(["Control", "IFNa", "IFNg"], [Ctrl_filtered.shape[0], IFNa_filtered.shape[0], IFNg_filtered.shape[0]], axis=0)
+
+scv.pp.filter_and_normalize(both, min_shared_counts=s, n_top_genes=n)
+
+data = both
+
+scv.pp.moments(data)
+scv.tl.umap(data, min_dist=1)
+scv.plotting.umap(data, color="induct",palette=("grey", "#990033","#CC0033"), save=f"UMAP_{g}_{n}_{s}.pdf")
+
+scv.tl.velocity(data)
+scv.tl.velocity_graph(data)
+scv.pl.velocity_embedding_stream(data , basis='umap', color='induct',palette=("grey", "#990033", "#CC0033"), save=f"Velocity_{g}_{n}_{s}.png")
+
+cr.tl.initial_states(data , cluster_key="induct", n_states=1)
+cr.pl.initial_states(data , discrete=True, save=f"Initial_state_{g}_{n}_{s}.pdf")
+
+cr.tl.terminal_states(data , cluster_key="induct",  n_states=3,  weight_connectivities=0.2)
+cr.pl.terminal_states(data , discrete=True, save=f"Terminal_states_{g}_{n}_{s}.pdf")
+
+scv.tl.paga(data, groups='induct')
+scv.pl.paga(data, basis = "umap", palette=("grey", "#990033", "#CC0033"), save=f"UMAP_paga_{g}_{n}_{s}.pdf")
+
+scv.tl.velocity_pseudotime(data)
+
+pseudo_time = scv.tl.velocity_pseudotime(data)
+scv.pl.scatter(data, color='velocity_pseudotime', color_map='gnuplot', save = f'Pseudotime_ntop{n}_shared{s}_{g}.pdf')
+Pseudotime_value = pd.DataFrame(data.obs['velocity_pseudotime'])
+Pseudotime_value.to_csv(f'Pseudotimes_{g}_{n}_{s}.csv')
+
+
+cr.tl.lineages(data)
+cr.pl.lineages(data, save=f'lineage_{g}_{n}_{s}.pdf')
+
+cr.pl.lineages(data, same_plot=False, save=f'lineage_{g}_{n}_{s}.pdf')
+
+drivers = cr.tl.lineage_drivers(data)
+drivers.to_csv(f'Drivers_{g}.csv')
+```
+
+### Import bootstraps
+
+```{r}
+
+### Récupération des bootstraps
+Boots = list()
+Boot = paste('boot', seq(1:20), sep='')
+
+for (b in 1:20){
+   Boots[[b]] = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/Bootstraps/boot%i_IFNg_IFNa_Ctrl.csv', b))[,2]
+}
+
+```
+
+```{r}
+Best_Param = function(g, ntop, shared, id1, id2, col1, col2){
+   All_param = list()
+
+   for( b in 1:length(Boot)){
+      boots = c()
+      parametre = Wstat = pvalue = c()
+      pdf(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/%s/Distribution_PseudoT.pdf', g, cond))
+
+      for (n in ntop){
+         for (s in shared){
+            print(c(n, s))
+            PseudoT = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/%s/boot%i/Pseudotimes_%s_%s_%i_%i.csv', g, cond ,b, cond, g, n, s ))
+            PseudoT_ctrl = PseudoT[grep(id1, PseudoT$X),]
+            PseudoT_act = PseudoT[grep(id2, PseudoT$X),]
+            par(mfrow = c(2,1))
+            hist(PseudoT_ctrl$velocity_pseudotime, xlim =c(0,1), breaks = 100, col=col1, xlab = '', main= sprintf('Pseudotimes (%s) [%i_%i]', id1, n, s))
+            abline(v=mean(PseudoT_ctrl$velocity_pseudotime), col = 'red',lwd=2)
+            hist(PseudoT_act$velocity_pseudotime, xlim =c(0,1), breaks = 100, col=col2, main=sprintf('Pseudotimes (%s) [%i_%i]', id2, n, s), xlab='')
+            abline(v=mean(PseudoT_act$velocity_pseudotime), col = 'red',lwd=2)
+
+            #Wstat = c(Wstat, as.vector(wilcox.test(PseudoT_ctrl$velocity_pseudotime, PseudoT_act$velocity_pseudotime)$statistic))
+            Wstat = c(Wstat, as.vector(wilcox.test(PseudoT_act$velocity_pseudotime, PseudoT_ctrl$velocity_pseudotime)$statistic))
+
+            pvalue = c(pvalue, as.vector(wilcox.test(PseudoT_ctrl$velocity_pseudotime, PseudoT_act$velocity_pseudotime)$p.value))
+            parametre = c(parametre, paste(n, s, sep='_'))
+            boots = c(boots, Boot[b])
+         }
+      }
+
+      pseudoT_Wilcox = data.frame(Bootstraps = boots, Parametres = parametre, W_stat = Wstat, p_value= pvalue)
+      names(pseudoT_Wilcox)[3:4] =  paste(names(pseudoT_Wilcox)[3:4], sprintf('_%s',cond))
+      All_param[[b]] = pseudoT_Wilcox
+      dev.off()
+   }
+
+   return(ldply(lapply(All_param, function(w) as.data.frame(w)), rbind))
+   #return(pseudoT_Wilcox)
+}
+```
+
+
+```{r}
+cond = 'Ctrl_IFNa' 
+id1 = 'Control' #Control
+id2 = 'IFNa'
+ntop = c(15,20)
+shared = c(25,50,75,100)
+g = 'HMGO_IFNg'
+
+setwd(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/%s', g, cond))
+
+param = Best_Param(g, ntop, shared, id1, id2, color, color2)
+write.csv(param, sprintf('All_param_%s_W.csv', cond))
+#param = param[grep(max(param$Distance), param$Distance),'Parametres']
+#param_O = param
+```
+
+# Select best parameters
+```{r}
+Ctrl_IFNa_param = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/Ctrl_IFNa/All_param_Ctrl_IFNa_W.csv', g))
+Ctrl_IFNg_param = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/Ctrl_IFNg/All_param_Ctrl_IFNg_W.csv', g))
+IFNa_IFNg_param1 = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/IFNa_IFNg/All_param_IFNa_IFNg_W.csv', g))
+IFNa_IFNg_param2 = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/IFNa_IFNg/All_param_IFNa_IFNg_W2.csv', g))
+
+Comb_parameters = unique(Ctrl_IFNa_param$Parametres)
+
+W_l = list()
+
+for (b in 1:length(Boot)){
+   W = c()
+   print(sprintf('Bootstrap %s', b))
+   for (i in 1:length(Comb_parameters)){
+      p = Comb_parameters[i]
+      print(p)
+      p1 = Ctrl_IFNa_param[which(Ctrl_IFNa_param$Parametres == p),][b,'W_stat._Ctrl_IFNa']
+      p2 = Ctrl_IFNg_param[which(Ctrl_IFNg_param$Parametres == p),][b,'W_stat._Ctrl_IFNg']
+      p3.1 = IFNa_IFNg_param1[which(IFNa_IFNg_param1$Parametres == p),][b,'W_stat._IFNa_IFNg']
+      p3.2 = IFNa_IFNg_param2[which(IFNa_IFNg_param2$Parametres == p),][b,'W_stat._IFNa_IFNg']
+      p3 = max(p3.1, p3.2)
+      W_tot = p1+p2+p3
+      W = c(W,W_tot)
+   }
+   W_l[[b]] = W
+}
+names(W_l) = Boot
+
+IDx_max_Wtot = lapply(W_l, function(x) which(x == max(x))[1])
+
+Best_param_per_boot = Comb_parameters[unlist(IDx_max_Wtot)]
+
+setwd(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/', g))
+write.csv(Best_param_per_boot, 'Best_param_per_boot.csv')
+#saveRDS(Best_param, 'Best_param_Glyco_Oxphos.Rds')
+
+```
+
+### Prédiction AUCell with bootstraps
+
+```{r, include = FALSE, echo = FALSE}
+Boot = paste('Boot', seq(1:20), sep='')
+s_AUCell = c(0.05, 0.1, 0.15, 0.2)
+ncores = 8
+FCTHRESHOLD <- log2(1.5)
+seuil_FDR <- 0.05
+
+seuil_AUCell = list()
+all_seuil_AUCell = list()
+
+
+gset_ID_v = c('HM_OverExpr')#, 'HM',  'HM_drivers','GO_OverExpr', 'GO', 'GO_drivers', 'HMGO', 'HMGO_drivers', 'spls')
+
+for (id in 1:length(gset_ID_v)){
+   gset_ID = gset_ID_v[id]
+   print(gset_ID)
+   
+   for (s in 1 : length(s_AUCell)){
+      aucell.v <- c()
+      
+      for (b in 1:length(Boot)){
+         print(sprintf("Bootstrap randomisation: n=%d", b))
+
+         
+            if (gset_ID == 'spls'){
+               gset = gene_spls_IFNg
+            }
+         
+            if (gset_ID == 'HM_OverExpr'){
+               gset = HM_IFNg
+            }
+         
+            if (gset_ID == 'HM'){
+               gset = HM
+            }
+            
+            if (gset_ID == 'HM_drivers'){
+               Drivers = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/HM_%s/3pop/all_drivers_HM_%s_boot%i.csv',pid, pid, b-1))
+               Drivers = Drivers[which(Drivers[,sprintf('%s.qval', pid)] < 0.05 & Drivers[,sprintf('%s.corr', pid)] >0),]
+               gset = Drivers[which(Drivers[,sprintf('%s.qval', pid)] < 0.05 & Drivers[,sprintf('%s.corr', pid)] >0),"Gene"]
+            }
+
+            if (gset_ID == 'GO') {
+               gset = GO
+            }
+         
+            if (gset_ID == 'GO_OverExpr') {
+               gset = GO_OverExp
+            }
+         
+            if (gset_ID == 'GO_drivers') {
+               Drivers = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/GO_%s/3pop/all_drivers_GO_%s_boot%i.csv', pid, pid, b-1))
+               Drivers = Drivers[which(Drivers[,sprintf('%s.qval', pid)] < 0.05 & Drivers[,sprintf('%s.corr', pid)] >0),]
+               gset = Drivers[which(Drivers[,sprintf('%s.qval', pid)]< 0.05 & Drivers[,sprintf('%s.corr', pid)] >0),"Gene"]
+            }
+         
+            if (gset_ID == 'HMGO'){
+               gset = unique(c(HM2, GO2))
+            }
+
+            if (gset_ID == 'HMGO_drivers'){
+               Drivers = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/HMGO_%s/3pop/all_drivers_HMGO_%s_boot%i.csv',pid, pid, b-1))
+               Drivers = Drivers[which(Drivers[,sprintf('%s.qval', pid)]  < 0.05 & Drivers[,sprintf('%s.corr', pid)]  >0),]
+               gset = Drivers[which(Drivers[,sprintf('%s.qval', pid)] < 0.05 & Drivers[,sprintf('%s.corr', pid)]  >0),"Gene"]
+            }
+          
+            if (pid == 'IFNa'){
+               subcells = Boots[[b]]
+               subcells = gsub('IFNg', 'Control', subcells)
+            }
+            if (pid == 'IFNg'){
+               subcells = Boots[[b]]
+               subcells = gsub('IFNa', 'Control', subcells)
+            }
+         
+         subcells = gsub('Control', 'inactiv', subcells)
+         subcells = gsub(pid, 'activ', subcells)
+
+         subcells = which(colnames(both) %in% subcells)
+
+         discov <- both[,subcells]
+         valid <- both[,-subcells]
+         dactiv <- isActiv[subcells]
+         vactiv <- isActiv[-subcells]
+   
+         # AUCell GSEA score
+         geneSets[[activity]]@geneIds <- gset
+         gs <- geneSets[[activity]]
+
+         cells_rankings <- AUCell_buildRankings(as.matrix(valid), plotStats=FALSE)
+         cells_AUC <- AUCell_calcAUC(gs, cells_rankings, aucMaxRank = ceiling(s_AUCell[s] * nrow(cells_rankings)))
+         score <- as.vector(AUCell::getAUC(cells_AUC))
+         names(score) <- colnames(valid)
+         
+         vdat=data.frame(isActiv=vactiv, Score=score)
+         aucell.roc=roc(isActiv ~ Score, data=vdat, levels=c("0", "1"))
+         aucell.v <- c(aucell.v, auc(aucell.roc))
+      }
+      seuil_AUCell[[s]] = aucell.v
+   }
+names(seuil_AUCell) = s_AUCell
+all_seuil_AUCell[[id]] = seuil_AUCell
+}
+names(all_seuil_AUCell) = gset_ID_v
+
+setwd(sprintf('/mnt/Commun/sc_Induction/IFNs/%s_pred/', pid))
+# 
+pdf(sprintf('All_seuil_AUCell_from_%s.pdf',pid))
+boxplot(all_seuil_AUCell$HM, ylim = c(0.5,1), ylab = "HM")
+boxplot(all_seuil_AUCell$HM_OverExpr, ylim = c(0.5,1), ylab = "HM_OverExpr")
+boxplot(all_seuil_AUCell$HM_drivers, ylim = c(0.5,1), ylab = "HM drivers")
+
+boxplot(all_seuil_AUCell$GO, ylim = c(0.5,1), ylab = "GO")
+boxplot(all_seuil_AUCell$GO_drivers, ylim = c(0.5,1), ylab = "GO drivers")
+
+boxplot(all_seuil_AUCell$HMGO, ylim = c(0.5,1), ylab = "HMGO")
+boxplot(all_seuil_AUCell$HMGO_drivers, ylim = c(0.5,1), ylab = "HMGO drivers")
+
+boxplot(all_seuil_AUCell$spls, ylim = c(0.5,1), ylab = "HMOverExpr + GO + Spls genes IFNa")
+
+
+dev.off()
+
+saveRDS(all_seuil_AUCell, 'all_seuil_AUCell.Rds')
+
+
+## Verfi des bons genes/pop a prendre pour prédiction
+
+pdf('Distri_splsGenes_pop1.pdf')
+par(mfrow=(c(2,1)))
+hist(score[grep('_activ', names(score))], breaks = 100, main = "AUCell score (IFNa Cells)" , col = color, xlab = 'AUCell Score')
+hist(score[grep('_inactiv', names(score))], breaks = 100, main = "AUCell score (IFNg+Ctrl Cells)" , col = 'grey', xlab = 'AUCell Score')
+
+dev.off()
+
+```
+
+
+####################################################
+#                                                  #
+#                                                  #
+#            Validation finale / Evaluation        #
+#                                                  #
+#                                                  #
+####################################################
+
+```{r}
+ntop = c(15,20, 25)
+shared = c(25,50,75)
+# 
+g = 'GO_IFNa'
+genes = GO
+cond  = 'IFNa_IFNg'
+id1 = 'IFNa'
+id2 = 'IFNg'
+col1 = color
+col2 = color2
+
+setwd(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/Without_boot/%s/', g, cond))
+```
+### Best param on all cells
+```{r}
+
+parametre = Wstat = pvalue = c()
+pdf(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/Without_boot/%s/Distribution_PseudoT.pdf', g, cond))
+
+Wstat = pvalue = parametre = c()
+for (n in ntop){
+   for (s in shared){
+      print(c(n, s))
+      PseudoT = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/Without_boot/%s/Pseudotimes_%s_%i_%i.csv', g, cond, g, n, s ))
+      PseudoT_ctrl = PseudoT[grep(id1, PseudoT$X),]
+      PseudoT_act = PseudoT[grep(id2, PseudoT$X),]
+      par(mfrow = c(2,1))
+      hist(PseudoT_ctrl$velocity_pseudotime, xlim =c(0,1), breaks = 100, col=col1, xlab = '', main= sprintf('Pseudotimes (%s) [%i_%i]', id1, n, s))
+      abline(v=mean(PseudoT_ctrl$velocity_pseudotime), col = 'red',lwd=2)
+      hist(PseudoT_act$velocity_pseudotime, xlim =c(0,1), breaks = 100, col=col2, main=sprintf('Pseudotimes (%s) [%i_%i]', id2, n, s), xlab='')
+      abline(v=mean(PseudoT_act$velocity_pseudotime), col = 'red',lwd=2)
+
+            Wstat = c(Wstat, as.vector(wilcox.test(PseudoT_ctrl$velocity_pseudotime, PseudoT_act$velocity_pseudotime)$statistic))
+            #Wstat = c(Wstat, as.vector(wilcox.test(PseudoT_act$velocity_pseudotime, PseudoT_ctrl$velocity_pseudotime)$statistic))
+
+            pvalue = c(pvalue, as.vector(wilcox.test(PseudoT_ctrl$velocity_pseudotime, PseudoT_act$velocity_pseudotime)$p.value))
+            parametre = c(parametre, paste(n, s, sep='_'))
+            
+   }
+}
+dev.off()
+
+pseudoT_Wilcox = data.frame(Parametres = parametre, W_stat = Wstat, p_value= pvalue)
+write.csv(pseudoT_Wilcox, sprintf('All_param_%s_W2.csv', cond))
+```
+
+# Select best parameters
+```{r}
+Ctrl_IFNa_param = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/HM_IFNg/Without_boot/Ctrl_IFNa/All_param_Ctrl_IFNa_W.csv', g))
+Ctrl_IFNg_param = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/HM_IFNg/Without_boot/Ctrl_IFNg/All_param_Ctrl_IFNg_W.csv', g))
+IFNa_IFNg_param1 = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/HM_IFNg/Without_boot/IFNa_IFNg/All_param_IFNa_IFNg_W.csv', g))
+IFNa_IFNg_param2 = read.csv(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/HM_IFNg/Without_boot/IFNa_IFNg/All_param_IFNa_IFNg_W2.csv', g))
+
+Comb_parameters = unique(Ctrl_IFNa_param$Parametres)
+
+W=c()
+
+for (i in 1:length(Comb_parameters)){
+   p = Comb_parameters[i]
+   print(p)
+   p1 = Ctrl_IFNa_param[which(Ctrl_IFNa_param$Parametres == p),][,'W_stat']
+   p2 = Ctrl_IFNg_param[which(Ctrl_IFNg_param$Parametres == p),][,'W_stat']
+   p3.1 = IFNa_IFNg_param1[which(IFNa_IFNg_param1$Parametres == p),][,'W_stat']
+   p3.2 = IFNa_IFNg_param2[which(IFNa_IFNg_param2$Parametres == p),][,'W_stat']
+   p3 = max(p3.1, p3.2)
+   W_tot = p1+p2+p3
+   W = c(W,W_tot)
+}
+
+Best_param = Comb_parameters[which(W == max(W))]
+
+setwd(sprintf('/mnt/Commun/sc_Induction/IFNs/SCENT/%s/Without_boot/', g))
+write.csv(Best_param, 'Best_param_all_cells.csv')
+#saveRDS(Best_param, 'Best_param_Glyco_Oxphos.Rds')
+
+```
+
+# Evaluation du modéle avec la liste de gènes finale 
+```{r}
+Drivers = read.csv('/mnt/Commun/sc_Induction/IFNs/IFNg_pred/signature_finale_IFNg.csv')$x
+
+geneSets[[activity]]@geneIds <- Drivers
+gs <- geneSets[[activity]]
+score = Score_AUCell(as.matrix(both), gs, 0.2)
+names(score) <- colnames(both)
+
+summary(score)
+dat=data.frame(isActiv=isActiv, Score=score)
+aucell.roc=roc(isActiv ~ Score, data=dat, levels=c("0", "1"))
+
+seuil = seq(from=as.vector(summary(score))[1],to=as.vector(summary(score))[6],by=0.01)
+Se = Sp = Pr = R = Fmes = c()
+for (s in 1:length(seuil)){
+   VP = as.vector(table(score[grep('_activ',names(score))]>seuil[s])[2])
+   FP = as.vector(table(score[grep('_activ',names(score))]>seuil[s])[1])
+   VN = as.vector(table(score[grep('_inactiv',names(score))]<seuil[s])[2])
+   FN = as.vector(table(score[grep('_inactiv',names(score))]<seuil[s])[1])
+   
+   Sensibility = VP/(FN+VP)
+   Se[s] = Sensibility
+   Specificity = VN/(VN+FP)
+   Sp[s] = Specificity
+   Precision = VP/(VP+FP)
+   Pr[s] = Precision
+   Recall = VP/(VP+FN)
+   R[s] = Recall
+   Fmesure = 2*Precision*Recall / (Precision+Recall)
+   Fmes[s] = Fmesure
+}
+
+#id_seuil=which(abs(Se-Sp) == min(abs(Se-Sp)))
+
+id_seuil=grep(max(Fmes[which(Pr > 0.5)]), Fmes)
+
+final_seuil = seuil[id_seuil]
+
+setwd(sprintf('/mnt/Commun/sc_Induction/IFNs/%s_pred/',pid))
+saveRDS(final_seuil, sprintf('final_seuil_%s.RDS', pid))
+saveRDS( aucell.roc, sprintf('AUC_score_%s_allCells.RDS', pid))
+
+pdf(sprintf('Evaluation_modele_%s.pdf', pid))
+par(mfrow = c(2,1))
+hist(score[grep('_activ',names(score))], breaks = 50, main = 'AUCell score in Activ cells', xlab = 'AUCell score', xlim = c(as.vector(summary(score)[1]), as.vector(summary(score)[6])), col=color)
+abline(v=final_seuil, col='red')
+hist(score[grep('_inactiv',names(score))], breaks = 50, main = 'AUCell score in Inactiv cells', xlab = 'AUCell score', xlim = c(as.vector(summary(score)[1]), as.vector(summary(score)[6])), col = "grey")
+abline(v=final_seuil, col='red')
+par(mfrow = c(1,1))
+
+plot(aucell.roc, main = sprintf('AUC score = %.2f \n Sen=%.2f Spe=%.2f Fmes=%.2f',aucell.roc$auc, Se[id_seuil], Sp[id_seuil], Fmes[id_seuil]))
+
+dev.off()
+
+```
