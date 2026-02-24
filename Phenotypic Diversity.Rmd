@@ -1,0 +1,568 @@
+---
+title: "Phenotypic diversity (public data)"
+author: "Angèle COUTANT"
+date: "2025-09-22"
+output:
+  html_document:
+    toc: true        # Activer le sommaire
+    toc_depth: 2     # Profondeur des titres dans le sommaire (par défaut 2)
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(Seurat)
+library(AUCell)
+library(vioplot)
+library(networkD3)
+library(dplyr)
+library(heatmap3)
+library(gplots)
+library(sctransform)
+library(corto)
+library(beeswarm)
+library(ggplot2)
+library(vegan)
+
+setwd('/mnt/Commun/sc_Induction/Public_data/')
+
+Act = c("EMT", 'Glyco', 'OxPhos', 'IFNa', 'IFNg', 'DNArep')
+col_Act = c('#339900', "#FFCC33","#E69F00",  "#990033", "#CC0033",'#0066CC')
+col_pheno <- c("Basal" = '#660000', "Her2" = "#003399", "LumA" = '#66CC33', "LumB" = "#009933", 'Normal' = 'grey')
+
+# Import metadata
+metadata_Wu = read.csv('/mnt/Commun/Donnees/breast_cancer_data/GSE176078_Wu_etal_2021_BRCA_scRNASeq/Wu_etal_2021_BRCA_scRNASeq/metadata.csv', row.names = "X")
+metadata = readRDS('/mnt/Commun/sc_Induction/Public_data/Analyse_Lignee_Patients/RDSobj/metadata_sorted.RDS')
+
+# load("/mnt/Commun/sc_Induction/Public_data/Donnees/BreastCancerCellLines_seurat_processed_merged.RData")
+# lignee = as.matrix(bccl@assays[["RNA"]]@counts)
+# Data_BC_Wu = ReadMtx('/mnt/Commun/Donnees/breast_cancer_data/GSE176078_Wu_etal_2021_BRCA_scRNASeq/Wu_etal_2021_BRCA_scRNASeq/count_matrix_sparse.mtx', '/mnt/Commun/Donnees/breast_cancer_data/GSE176078_Wu_etal_2021_BRCA_scRNASeq/Wu_etal_2021_BRCA_scRNASeq/count_matrix_barcodes.tsv', '/mnt/Commun/Donnees/breast_cancer_data/GSE176078_Wu_etal_2021_BRCA_scRNASeq/Wu_etal_2021_BRCA_scRNASeq/count_matrix_genes.tsv', feature.column = 1)
+# cancer = metadata_Wu[which(metadata_Wu$celltype_major=="Cancer Epithelial"),1]
+# lignee = as.matrix(bccl@assays[["RNA"]]@counts)
+# common_genes = intersect(rownames(lignee), rownames(Data_BC_Wu))
+# lignee = lignee[common_genes, ] # Lignée
+# Data_BC_Wu = Data_BC_Wu[common_genes, cancer]
+
+lignee_ID = metadata[which(metadata$population == 'Lignee'),'ID']
+patients_ID = metadata[which(metadata$population == 'Patients'),'ID']
+metadata_lignee = metadata[metadata$population=='Lignee',]
+metadata_patients = metadata[metadata$population=='Patients',]
+SsType = unique(metadata$SsType)
+
+# Import AUCell score from cancer cells
+m_score = readRDS('/mnt/Commun/sc_Induction/Public_data/Analyse_Lignee_Patients/RDSobj/mat_scoreAUCell_normalises.Rds') #Seuil à 0.05
+m_score_Optimal = readRDS('/mnt/Commun/sc_Induction/Public_data/Analyse_Lignee_Patients/RDSobj/mat_scoreAUCell_normalises_seuilOptimaux.Rds') #Seuil à 0.2 ou 0.15
+m_score_HM = readRDS('/mnt/Commun/sc_Induction/Public_data/Analyse_Lignee_Patients/RDSobj/mat_scoreAUCell_normalises_HM.Rds')
+```
+
+### Correlation AUCell score / UMIs
+
+Objectif : vérifier que les scores d'enrichissement obtenus avec AUCell ne soient pas impactés par le nombre de transcrit (counts/UMIs).
+
+```{r, include = FALSE}
+m_score_patient = matrix(ncol = ncol(m_score), nrow = 1)
+m_score_patient_optimal = matrix(ncol = ncol(m_score), nrow = 1)
+
+for (p in metadata_patients$ID){
+   m_score_patient = rbind(m_score_patient, m_score[grep(p, rownames(m_score)),])
+   m_score_patient_optimal = rbind(m_score_patient_optimal, m_score_Optimal[grep(p, rownames(m_score_Optimal)),])
+}
+
+m_score_patient = m_score_patient[-1,]
+m_score_patient_optimal = m_score_patient_optimal[-1,]
+
+metadata_Wu_sorted <- metadata_Wu[match(rownames(m_score_patient), rownames(metadata_Wu)), ]
+
+corMat <- corMat_optimal <- matrix(nc=ncol(m_score_patient), nr=6)
+
+colnames(corMat) <- colnames(corMat_optimal) <- Act
+rownames(corMat) = rownames(corMat_optimal) = rep('ncounts',6)
+
+for (i in 1:ncol(m_score_patient)) {
+   print(i)
+   for (j in 1:6){
+      print(j)
+      corMat[j,i] = cor.test(m_score_patient[,i], metadata_Wu_sorted$nCount_RNA,)$estimate
+      corMat_optimal[j,i] = cor.test(m_score_patient_optimal[,i], metadata_Wu_sorted$nCount_RNA)$estimate
+   }
+}
+corMat = corMat[1,]
+corMat_optimal = corMat_optimal[1,]
+
+df_corr_count = data.frame(Act = Act,
+                     cor_0.05 = as.vector(corMat),
+                     cor_optimal = as.vector(corMat_optimal))
+```
+```{r}
+################################################################################
+#                             PLOT RESULTAT                                    #
+################################################################################
+
+boxplot(df_corr_count$cor_0.05, df_corr_count$cor_optimal,
+        ylab = 'Corrélation de Pearson entre les Signatures et le nombre de counts' ,
+        ylim = c(-0.9, 0.9),
+        yaxt='n',
+        sub = sprintf('Test de student, pval = %.2f', t.test(df_corr_count$cor_0.05, df_corr_count$cor_optimal)$p.value))
+
+axis(1, at = c(1,2) , labels = c('seuils AUCell 0.05', 'seuils AUCell optimaux'))
+axis(2, at = seq(-1, 1, by = 0.25), las = 2)  # Axe Y avec les valeurs demandées
+
+beeswarm(list(df_corr_count$cor_0.05, df_corr_count$cor_optimal),
+         add = TRUE,
+         pch = 16,
+         pwcol = rep(col_Act,2), cex = 1.25)
+
+```
+
+### Correlation between activities
+
+Objectif : vérifier que les signatures ne soient pas corrélées entres elles dans les données publiques, et donc, bien spécifiques à chacune d'elles.
+
+```{r, include = FALSE}
+corMat <- corMat_optimal <- matrix(nc=ncol(m_score), nr=ncol(m_score))
+colnames(corMat) <- rownames(corMat) <- colnames(corMat_optimal) <- rownames(corMat_optimal) <- Act
+
+for (i in 1:ncol(m_score_patient)) {
+   for (j in i:ncol(m_score_patient)) {
+      print(i)
+      print(j)
+      corMat[i,j] = corMat[j,i] = cor.test(m_score_patient[,i], m_score_patient[,j])$estimate
+      corMat_optimal[i,j] = corMat_optimal[j,i] = cor.test(m_score_patient_optimal[,i], m_score_patient_optimal[,j])$estimate
+   }
+}
+```
+```{r}
+################################################################################
+#                                 PLOT RESULTAT                                #
+################################################################################
+
+# From AUCell score (threshold = 0.05)
+heatmap.2(corMat, col = bluered(100), Colv = FALSE, trace = 'none', Rowv=FALSE, scale='none', cexRow = 0.75, cexCol = 0.75,
+          cellnote = round(corMat,2), notecol="black",
+          symm = F, symkey = T, symbreaks = T)
+
+#Frome AUCell score (threshold = optimal)
+heatmap.2(corMat_optimal, col = bluered(100), Colv = FALSE, trace = 'none', Rowv=FALSE, scale='none', cexRow = 0.75, cexCol = 0.75,
+          cellnote = round(corMat_optimal,2), notecol="black",
+          symm = F, symkey = T, symbreaks = T)
+
+```
+
+### Mesure de la diversité phénotypique
+
+Objectif : calculer la distance euclidienne entre les profils d'activités
+
+```{r, include = FALSE}
+# Fonction qui calcule la distance euclidienne entre les cellules en prenant en compte toutes les activités cellulaires.
+Distance_MultiAct = function(mat_score, cell){
+   
+   All_dist_mat.multiact = list()
+   for (p in 1:length(cell)){
+      sub_mat = mat_score[grep(cell[p], rownames(mat_score)),]
+      multiact = as.matrix(dist(sub_mat, method = 'euclidean'))
+      All_dist_mat.multiact[[p]] = multiact[upper.tri(multiact)]
+   }
+   return(All_dist_mat.multiact)
+}
+
+# Fonction qui calcule la distance euclidienne entre les cellules selon les activités étudiées (par activité).
+Distance_PerAct = function(mat_score, cell){
+   All_dist_mat.perAct = list()
+
+   for (p in 1:length(cell)){
+
+      sub_mat = mat_score[grep(cell[p], rownames(mat_score)),]
+      dist_mat.perAct = list()
+     
+      for (col in 1:ncol(sub_mat)){
+         Dist_mat = as.matrix(dist(sub_mat[,col], method = 'euclidean'))
+         dist_mat.perAct[[col]] <- Dist_mat[upper.tri(Dist_mat)]
+      }
+      names(dist_mat.perAct) = paste(Act , rep("Distance", ncol(mat_score)), sep='_')
+      All_dist_mat.perAct[[p]] = dist_mat.perAct
+   }
+   return(All_dist_mat.perAct)
+}
+```
+
+## Analyse dans les cellules tumorales
+### Diversité selon les sous-types de cancer du sein
+
+```{r, include=FALSE}
+Dist_MultiAct = Distance_MultiAct(m_score, metadata$ID)
+Dist_PerAct = Distance_PerAct(m_score, metadata$ID)
+names(Dist_MultiAct) = names(Dist_PerAct) = metadata$ID
+
+```
+```{r}
+################################################################################
+#                             PLOT RESULTAT                                    #
+################################################################################
+df_MultiAct_median = cbind(metadata, t(as.data.frame(lapply(Dist_MultiAct, median))))
+colnames(df_MultiAct_median)[7] = 'Median_Dist'
+
+for (p in c('Lignee', 'Patients')){
+   par(mar=c(4, 4, 4, 15), xpd=TRUE)
+   sub = df_MultiAct_median[which(df_MultiAct_median$population == p),]
+   boxplot(sub$Median_Dist~sub$SsType, col = col_pheno, ylab = "Distances Mediane", xlab = '', ylim = c(0, 0.5), main = p)
+   if(p == 'Patients'){
+      PCH = seq(5,24)
+   }
+   if(p == 'Lignee'){
+      PCH = seq(1,14)
+   }
+   beeswarm(sub$Median_Dist~sub$SsType, add=T,
+         pwpch = PCH,
+            cex = 1.3)
+   legend('topright', inset = c(-0.3, 0),
+          legend = as.vector(as.factor(sub$ID)),
+          pch = PCH,
+          text.col = sub$couleur_scSubtype ,cex = 1.3, bty = 'n')
+}
+```
+
+### Diversité selon les activités cellulaires étudiées
+
+```{r, include = FALSE}
+library(dplyr)
+
+
+
+l_perAct_lignee = Dist_PerAct[which(names(Dist_PerAct) %in% lignee_ID)]
+l_perAct_patients = Dist_PerAct[which(names(Dist_PerAct) %in% patients_ID)]
+
+df_lignee_perAct = bind_rows(lapply(l_perAct_lignee, function(x) as.data.frame(x)))
+df_patient_perAct = bind_rows(lapply(l_perAct_patients, function(x) as.data.frame(x)))
+
+df_all_perAct = rbind(df_lignee_perAct, df_patient_perAct)
+
+median_dist_lignee = lapply(lapply(l_perAct_lignee, function(x) as.data.frame(x)), function(x) apply(x, 2, median))
+median_dist_patient = lapply(lapply(l_perAct_patients, function(x) as.data.frame(x)), function(x) apply(x, 2, median))
+
+All_dist_median = as.data.frame(rbind(bind_rows(median_dist_lignee), bind_rows(median_dist_patient)))
+All_dist_median = cbind(All_dist_median, c(rep('Lignée',14), rep('Patients', 20)))
+colnames(All_dist_median)[7] = 'From'
+
+sub_lignee = All_dist_median[which(All_dist_median$From == "Lignée"),]
+sub_patients = All_dist_median[which(All_dist_median$From == "Patients"),]
+
+# Choix de l'analyse : patients ou lignées
+
+cond = "Patients" # "Patients"
+
+if (cond == "lignées"){
+   sub = sub_lignee
+   met = metadata_lignee
+   bsw = rep(seq(1,14),6)
+   Pch = seq(1,14)
+}
+if (cond == "Patients"){
+   sub = sub_patients
+   met = metadata_patients
+   bsw = rep(seq(5,24),6)
+   Pch = seq(5,24)
+}
+
+# Convertir les données pour beeswarm
+
+data_long <- stack(sub[, -7])
+data_long$color <- rep(met$couleur_scSubtype, times = ncol(sub)-1)
+data_long$sStype <- rep(met$SsType, times = ncol(sub)-1)
+```
+```{r}
+################################################################################
+#                             PLOT RESULTAT                                    #
+################################################################################
+
+# par(mar=c(4, 4, 4, 10), xpd=TRUE)
+# boxplot(values ~ ind, data = data_long, col = col_Act,
+#         outline = FALSE, xlab = "", ylab = "Distances (median)",
+#         xaxt='n', ylim = c(0,0.3),
+#         main = cond)
+#
+# axis(1, at = 1:6, labels = Act, las = 2, cex.axis = 0.8)
+# beeswarm(data_long$values ~ data_long$ind,
+#          pwpch = bsw,
+#          pwcol = rep(met$couleur_scSubtype, 6),
+#          add = TRUE,
+#          cex = 1.25)
+#
+#    legend('topright', inset = c(-0.45, 0),
+#           legend = met$ID,
+#           pch = Pch,
+#           col = data_long$color ,
+#           cex = 1.3, bty = 'n')
+```
+
+### Comparaison entre lignées et patients
+
+```{r}
+################################################################################
+#                             PLOT RESULTATS                                   #
+################################################################################
+boxplot(df_MultiAct_median$Median_Dist ~ df_MultiAct_median$population, col = c('lightblue', 'cadetblue'), xlab = '', ylab="Distances multiactivité (médianes)")
+beeswarm(df_MultiAct_median$Median_Dist~df_MultiAct_median$population, add=T, pch = 16)
+t.test(unlist(Dist_MultiAct[metadata_patients$ID]), unlist(Dist_MultiAct[metadata_lignee$ID]))
+
+```
+```{r}
+obj_seurat = readRDS('/mnt/Commun/sc_Induction/Public_data/Analyse_Lignee_Patients/RDSobj/Seurat_obj.Rds')
+subtypes <- c()
+populations <- c()
+ID = c()
+
+# Remplir ces vecteurs en fonction des noms des cellules
+for (i in 1:length(colnames(obj_seurat))) {
+  cell_id <- strsplit(colnames(obj_seurat)[i], "_")[[1]][1]  # Extraire l'ID de la cellule
+  # Trouver le sous-type et la population dans metadata_sorted
+  subtype <- as.vector(metadata$SsType[metadata$ID == cell_id])
+  population <- as.vector(metadata$population[metadata$ID == cell_id])
+
+  # Assigner ces valeurs aux vecteurs
+  subtypes <- c(subtypes, subtype)
+  populations <- c(populations, population)
+  ID = c(ID, cell_id)
+}
+
+obj_seurat$subtype <- subtypes
+obj_seurat$population <- populations
+obj_seurat$ID = ID
+
+patients = metadata[which(metadata$population == 'Patients'),'ID']
+col_patients =  metadata[which(metadata$population == 'Patients'),'couleur_scSubtype']
+lignee = metadata[which(metadata$population == 'Lignee'),'ID']
+col_lignee = metadata[which(metadata$population == 'Lignee'),'couleur_scSubtype']
+
+valid_idents <- c(lignee,patients)
+obj_seurat <- subset(obj_seurat, idents = valid_idents)
+Idents(obj_seurat) <- factor(Idents(obj_seurat), levels = c(lignee, patients))
+
+# p = VlnPlot(obj_seurat, features =  "nCount_RNA",
+#            pt.size = 0,
+#            cols = c(col_lignee, col_patients))
+#
+# p = p + theme(legend.position = "none") + ggtitle("Distribution des UMIs dans toutes les cellules")
+
+p2 = VlnPlot(obj_seurat, features =  "nCount_RNA",
+        pt.size = 0, group.by = 'population',
+        cols = c('lightblue', 'cadetblue')) + theme(legend.position = "none") + ggtitle("Distribution des UMIs")
+
+
+p2
+
+# Test de student
+t.test(
+  obj_seurat$nCount_RNA[obj_seurat$population == "Lignee"],
+  obj_seurat$nCount_RNA[obj_seurat$population == "Patients"])
+```
+
+# Corrélation diversité phénotypique VS nb d'UMI
+
+Objectif : Vérifier que la diversité phénotypique mesurée n'est pas impactée par le nombre de transcrits
+
+## Dans les données de Patients
+
+```{r, include = FALSE}
+mean_count_patients = c()
+for (i in metadata_patients$ID){
+   print(i)
+   mean_count_patients = c(mean_count_patients, mean(metadata_Wu_sorted[grep(i, metadata_Wu_sorted$orig.ident), 'nCount_RNA']))
+}
+
+Rho = cor.test(mean_count_patients, df_MultiAct_median[which(df_MultiAct_median$population == 'Patients'),7] , method = 'spearman')
+```
+```{r}
+################################################################################
+#                             PLOT RESULTAT                                    #
+################################################################################
+
+# plot(mean_count_patients, df_MultiAct_median[which(df_MultiAct_median$population == 'Patients'),7],
+#      main = 'Patientes',
+#      xlab = 'n_counts moyen',
+#      ylab = 'Distances Multi-Activités (médianes)',
+#      xlim = c(0, 40000),
+#      ylim = c(0.18, 0.5),
+#      sub = sprintf('Rho = %.3f', Rho$estimate),
+#      pch = seq(5,24),
+#      cex = 1.3,
+#      col = df_MultiAct_median[which(df_MultiAct_median$population == 'Patients'),'couleur_scSubtype'])
+#
+# abline(lm(df_MultiAct_median[which(df_MultiAct_median$population == 'Patients'),7] ~ mean_count_patients), lwd = 1, col = 'red3')
+```
+
+### Dans les données de Lignées
+```{r, include = FALSE}
+load("/mnt/Commun/sc_Induction/Public_data/Donnees/BreastCancerCellLines_seurat_processed_merged.RData")
+bccl@meta.data[["orig.ident"]]
+count_lignee = as.matrix(bccl@meta.data[["nCount_RNA"]])
+rownames(count_lignee) = bccl@meta.data[["orig.ident"]]
+
+mean_count_lignees = c()
+for (i in metadata_lignee$ID){
+   print(i)
+   mean_count_lignees = c(mean_count_lignees, mean(as.vector(count_lignee[grep(paste0("^", i, "$"), rownames(count_lignee)),])))
+}
+Rho = cor.test(mean_count_lignees, df_MultiAct_median[which(df_MultiAct_median$population == 'Lignee'),7] , method = 'spearman')
+```
+```{r}
+################################################################################
+#                             PLOT RESULTAT                                    #
+################################################################################
+
+# plot(mean_count_lignees, df_MultiAct_median[which(df_MultiAct_median$population == 'Lignee'),7],
+#      main = 'Lignées',
+#      xlab = 'n_counts moyen',
+#      ylab = 'Distances Multi-Activités (médianes)',
+#      xlim = c(0, 40000),
+#      ylim = c(0.18, 0.5),
+#      sub = sprintf('Rho = %.3f',Rho$estimate),
+#      pch = seq(1,14),
+#      cex = 1.3,
+#      col = df_MultiAct_median[which(df_MultiAct_median$population == 'Lignee'),'couleur_scSubtype'])
+#
+# abline(lm(df_MultiAct_median[which(df_MultiAct_median$population == 'Lignee'),7] ~ mean_count_lignees), lwd = 1, col = 'red3')
+
+```
+
+# Analyse de la diversité dans les cellules saines
+
+Objectif : valider la mesure de diversité phénotypique dans les cellules saines en comparaison avec l'indice de diversité de Shannon
+
+```{r, include = FALSE}
+Normal_cells = rownames(metadata_Wu[which(metadata_Wu$celltype_major!="Cancer Epithelial"),])
+EpiNorm = rownames(metadata_Wu[which(metadata_Wu$celltype_major=="Normal Epithelial"),])
+Endothelial = rownames(metadata_Wu[which(metadata_Wu$celltype_major=="Endothelial"),])
+CAFs = rownames(metadata_Wu[which(metadata_Wu$celltype_major=="CAFs"),])
+PVL = rownames(metadata_Wu[which(metadata_Wu$celltype_major=="PVL"),])
+Bcells = rownames(metadata_Wu[which(metadata_Wu$celltype_major=="B-cells"),])
+Tcells = rownames(metadata_Wu[which(metadata_Wu$celltype_major=="T-cells"),])
+Myeloid = rownames(metadata_Wu[which(metadata_Wu$celltype_major=="Myeloid"),])
+Plasmablasts = rownames(metadata_Wu[which(metadata_Wu$celltype_major=="Plasmablasts"),])
+
+########## A partir des signatures transcriptomiques optimisées ################
+
+# Seuil AUCell à 0.05
+
+score_EMT = readRDS('/mnt/Commun/sc_Induction/Public_data/score_EMT_seuil0.05_NormalCell.Rds')
+score_Glyco = readRDS('/mnt/Commun/sc_Induction/Public_data/score_Glyco_seuil0.05_NormalCell.Rds')
+score_OxPhos = readRDS('/mnt/Commun/sc_Induction/Public_data/score_OxPhos_seuil0.05_NormalCell.Rds')
+score_IFNa = readRDS('/mnt/Commun/sc_Induction/Public_data/score_IFNa_seuil0.05_NormalCell.Rds')
+score_IFNg = readRDS('/mnt/Commun/sc_Induction/Public_data/score_IFNg_seuil0.05_NormalCell.Rds')
+score_DNArep = readRDS('/mnt/Commun/sc_Induction/Public_data/score_DNArep_seuil0.05_NormalCell.Rds')
+
+score_EMT =  (score_EMT-min(score_EMT)) * (1/max(score_EMT-min(score_EMT)))
+score_Glyco =  (score_Glyco-min(score_Glyco)) * (1/max(score_Glyco-min(score_Glyco)))
+score_OxPhos =  (score_OxPhos-min(score_OxPhos)) * (1/max(score_OxPhos-min(score_OxPhos)))
+score_IFNa =  (score_IFNa-min(score_IFNa)) * (1/max(score_IFNa-min(score_IFNa)))
+score_IFNg =  (score_IFNg-min(score_IFNg)) * (1/max(score_IFNg-min(score_IFNg)))
+score_DNArep =  (score_DNArep-min(score_DNArep)) * (1/max(score_DNArep-min(score_DNArep)))
+
+m_score = cbind(score_EMT, score_Glyco, score_OxPhos, score_IFNa, score_IFNg, score_DNArep)
+colnames(m_score) = c('score_EMT', 'score_Glyco', 'score_OxPhos', 'score_IFNa', 'score_IFNg', 'score_DNArep')
+
+# Seuil AUCell optimaux
+
+score_EMT_opt = readRDS('/mnt/Commun/sc_Induction/Public_data/score_EMT_seuilOpt_NormalCell.Rds')
+score_Glyco_opt = readRDS('/mnt/Commun/sc_Induction/Public_data/score_Glyco_seuilOpt_NormalCell.Rds')
+score_OxPhos_opt = readRDS('/mnt/Commun/sc_Induction/Public_data/score_OxPhos_seuilOpt_NormalCell.Rds')
+score_IFNa_opt = readRDS('/mnt/Commun/sc_Induction/Public_data/score_IFNa_seuilOpt_NormalCell.Rds')
+score_IFNg_opt = readRDS('/mnt/Commun/sc_Induction/Public_data/score_IFNg_seuilOpt_NormalCell.Rds')
+score_DNArep_opt = readRDS('/mnt/Commun/sc_Induction/Public_data/score_DNArep_seuilOpt_NormalCell.Rds')
+
+score_EMT_opt2 =  (score_EMT_opt-min(score_EMT_opt)) * (1/max(score_EMT_opt-min(score_EMT_opt)))
+score_Glyco_opt2 =  (score_Glyco_opt-min(score_Glyco_opt)) * (1/max(score_Glyco_opt-min(score_Glyco_opt)))
+score_OxPhos_opt2 =  (score_OxPhos_opt-min(score_OxPhos_opt)) * (1/max(score_OxPhos_opt-min(score_OxPhos_opt)))
+score_IFNa_opt2 =  (score_IFNa_opt-min(score_IFNa_opt)) * (1/max(score_IFNa_opt-min(score_IFNa_opt)))
+score_IFNg_opt2 =  (score_IFNg_opt-min(score_IFNg_opt)) * (1/max(score_IFNg_opt-min(score_IFNg_opt)))
+score_DNArep_opt2 =  (score_DNArep_opt-min(score_DNArep_opt)) * (1/max(score_DNArep_opt-min(score_DNArep_opt)))
+
+m_score_opt = cbind(score_EMT_opt2, score_Glyco_opt2, score_OxPhos_opt2, score_IFNa_opt2, score_IFNg_opt2, score_DNArep_opt2)
+colnames(m_score_opt) = c('score_EMT', 'score_Glyco', 'score_OxPhos', 'score_IFNa', 'score_IFNg', 'score_DNArep')
+
+########## A partir des signatures transcriptomiques HM, seuil AUCell 0.05 ################
+
+score_EMT_HM = readRDS('/mnt/Commun/sc_Induction/Public_data/score_HM_EMT_seuil0.05_NormalCell.Rds')
+score_Glyco_HM = readRDS('/mnt/Commun/sc_Induction/Public_data/score_Glyco_HM_seuil0.05_NormalCell.Rds')
+score_OxPhos_HM = readRDS('/mnt/Commun/sc_Induction/Public_data/score_HM_OxPhos_seuil0.05_NormalCell.Rds')
+score_IFNa_HM = readRDS('/mnt/Commun/sc_Induction/Public_data/score_HM_IFNa_seuil0.05_NormalCell.Rds')
+score_IFNg_HM = readRDS('/mnt/Commun/sc_Induction/Public_data/score_HM_IFNg_seuil0.05_NormalCell.Rds')
+score_DNArep_HM = readRDS('/mnt/Commun/sc_Induction/Public_data/score_HM_DNArep_seuil0.05_NormalCell.Rds')
+
+score_EMT_HM2 =  (score_EMT_HM-min(score_EMT_HM)) * (1/max(score_EMT_HM-min(score_EMT_HM)))
+score_Glyco_HM2 =  (score_Glyco_HM-min(score_Glyco_HM)) * (1/max(score_Glyco_HM-min(score_Glyco_HM)))
+score_OxPhos_HM2 =  (score_OxPhos_HM-min(score_OxPhos_HM)) * (1/max(score_OxPhos_HM-min(score_OxPhos_HM)))
+score_IFNa_HM2 =  (score_IFNa_HM-min(score_IFNa_HM)) * (1/max(score_IFNa_HM-min(score_IFNa_HM)))
+score_IFNg_HM2 =  (score_IFNg_HM-min(score_IFNg_HM)) * (1/max(score_IFNg_HM-min(score_IFNg_HM)))
+score_DNArep_HM2 =  (score_DNArep_HM-min(score_DNArep_HM)) * (1/max(score_DNArep_HM-min(score_DNArep_HM)))
+
+m_score_HM = cbind(score_EMT_HM2, score_Glyco_HM2, score_OxPhos_HM2, score_IFNa_HM2, score_IFNg_HM2, score_DNArep_HM2)
+colnames(m_score_HM) = c('score_EMT', 'score_Glyco', 'score_OxPhos', 'score_IFNa', 'score_IFNg', 'score_DNArep')
+
+score = m_score # m_score_HM , m_score_opt
+
+Dist_MultiAct = Distance_MultiAct(score, metadata$ID)
+names(Dist_MultiAct) =  metadata$ID
+
+shannon = c()
+
+for (p in metadata_patients$ID){
+   sub_mat = score[grep(p, rownames(score)),]
+   
+   interCells = intersect(rownames(sub_mat), c(EpiNorm,
+                                                Endothelial,
+                                                CAFs,
+                                                PVL,
+                                                Bcells,
+                                                Tcells,
+                                                Myeloid,
+                                                Plasmablasts
+                                              ))
+   
+   iEpiNorm = interCells[which(interCells %in% EpiNorm)]
+   iEndothelial = interCells[which(interCells %in% Endothelial)]
+   iCAFs = interCells[which(interCells %in% CAFs)]
+   iPVL = interCells[which(interCells %in% PVL)]
+   iBcells = interCells[which(interCells %in% Bcells)]
+   iTcells = interCells[which(interCells %in% Tcells)]
+   iMyeloid = interCells[which(interCells %in% Myeloid)]
+   iPlasmoblasts = interCells[which(interCells %in% Plasmablasts)]
+
+   shannon[p] <- diversity(c(length(iEpiNorm),
+                                length(iEndothelial),
+                                length(iCAFs),
+                                length(iPVL),
+                                length(iBcells),
+                                length(iTcells),
+                                length(iMyeloid),
+                                length(iPlasmoblasts)),
+                              index = "shannon")
+}
+
+Distance_multiAct_normal = unlist(lapply(Dist_MultiAct, mean))[15:34]
+Cor_ShaDist = cor.test(shannon, Distance_multiAct_normal, method = 'spearman')
+
+df <- data.frame(
+  ID = names(Distance_multiAct_normal),
+  Distance_multiAct_normal = as.numeric(Distance_multiAct_normal),
+  shannon = shannon
+)
+df <- merge(df, metadata, by.x = "ID", by.y = "ID")
+```
+```{r}
+################################################################################
+#                             PLOT RESULTAT                                    #
+################################################################################
+plot(df$shannon ~ df$Distance_multiAct_normal,
+     col = df$couleur_scSubtype,
+     pch = 19,
+     sub = sprintf("Corr = %.2f (pval = %.2f)", Cor_ShaDist$estimate, Cor_ShaDist$p.value),
+     xlab = "Distance Multi Act",
+     ylab = "Shannon")
+
+abline(lm(shannon ~ Distance_multiAct_normal), col = 'red3')
+```
+
+
